@@ -110,6 +110,7 @@ def _default_metadata_record() -> dict[str, Any]:
     return {
         "record_type": "metadata",
         "name": "default-benchmark",
+        "schema_version": 1,
         "created_at": _now_iso(),
     }
 
