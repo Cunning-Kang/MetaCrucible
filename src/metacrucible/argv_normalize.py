@@ -482,6 +482,23 @@ def normalize_execution_boundary(
             extra={"allowed_strings": []},
         )
 
+    # Strict read-path gate (ADR 0031, Issue #13 AC2). The boundary
+    # is allowed to declare ``strict_read_paths: true`` as an
+    # unknown-shape field; the workspace helper
+    # :func:`metacrucible.workspace_isolation.validate_strict_read_paths`
+    # blocks the case because the MVP adapter cannot approximate
+    # read paths by workspace masking. The check runs after the
+    # tool/command validation so a malformed boundary still reports
+    # its shape errors with the same ids callers already branch on.
+    from .workspace_isolation import validate_strict_read_paths
+
+    strict_result = validate_strict_read_paths(boundary)
+    if not strict_result["ok"]:
+        return _blocked_result(
+            strict_result["blockers"],
+            extra={"allowed_strings": []},
+        )
+
     allowed_strings = [
         _argv_to_bash_allow_string(argv) for argv in target_commands_raw
     ]

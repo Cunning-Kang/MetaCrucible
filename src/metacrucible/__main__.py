@@ -85,6 +85,23 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="emit a parseable JSON object on stdout",
     )
+    init_parser.add_argument(
+        "--no-isolation",
+        action="store_true",
+        help=(
+            "skip copy-on-write workspace masking (Issue #13); "
+            "requires --confirm-no-isolation and a TTY, or the "
+            "METACRUCIBLE_ALLOW_NO_ISOLATION=1 env-var override"
+        ),
+    )
+    init_parser.add_argument(
+        "--confirm-no-isolation",
+        action="store_true",
+        help=(
+            "explicit human confirmation that workspace masking is "
+            "intentionally being disabled (Issue #13 AC3)"
+        ),
+    )
     promote_parser = subparsers.add_parser(
         "promote",
         help="promote a generated benchmark case after human review",
@@ -316,13 +333,52 @@ def cmd_init(args: argparse.Namespace) -> int:
         }
         _emit(payload, as_json=args.json)
         return 0 if result["ok"] else CHECK_BLOCKED_EXIT_CODE
+    # ``--no-isolation`` gate (Issue #13 AC3+AC4). The flag is a
+    # safety escape hatch for callers that intentionally want to
+    # skip copy-on-write masking; the gate refuses the call unless
+    # the caller passed ``--confirm-no-isolation`` AND either stdin
+    # is a TTY or the explicit env-var override is set. The
+    # validation lives in :mod:`metacrucible.workspace_isolation`.
+    if getattr(args, "no_isolation", False):
+        from .workspace_isolation import validate_no_isolation
+
+        interactive = sys.stdin.isatty()
+        gate = validate_no_isolation(
+            confirmed=bool(getattr(args, "confirm_no_isolation", False)),
+            interactive=interactive,
+        )
+        if not gate["ok"]:
+            payload = {
+                "workspace": str(workspace),
+                "ok": gate["ok"],
+                "blockers": gate["blockers"],
+            }
+            _emit(payload, as_json=args.json)
+            return CHECK_BLOCKED_EXIT_CODE
     paths = _create_workspace(workspace)
+    # Boundary report (ADR 0031, Issue #13 AC1). When
+    # ``--no-isolation`` is set the gate above has already passed,
+    # so masking is intentionally skipped and the report is
+    # recorded as ``masking: "skipped"`` so a reviewer can tell the
+    # silent-skip from a successful plan.
+    boundary_report: dict[str, Any]
+    if getattr(args, "no_isolation", False):
+        boundary_report = {
+            "ok": True,
+            "blockers": [],
+            "masking": "skipped",
+        }
+    else:
+        from .workspace_isolation import plan_workspace_mask
+
+        boundary_report = plan_workspace_mask(workspace)
     payload = {
         "workspace": str(paths["workspace"]),
         "envelope_path": str(paths["envelope_path"]),
         "state_path": str(paths["state_path"]),
         "benchmark_path": str(paths["benchmark_path"]),
         "created": paths["created"],
+        "boundary_report": boundary_report,
     }
     _emit(payload, as_json=args.json)
     return 0
