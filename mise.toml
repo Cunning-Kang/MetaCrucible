@@ -1,0 +1,21 @@
+# MetaCrucible toolchain (Issue #1).
+#
+# `mise.toml` is the single source of truth for project tool versions and
+# task definitions. `mise install` provisions the listed tools and
+# project virtualenv; `mise run <task>` executes a task. No competing
+# environment manager (pyenv, poetry, pipenv, conda, asdf, ...) is to be
+# added at the repo root without a rationale documented in this file.
+[tools]
+python = "3.14"
+
+[env]
+_.python.venv = { path = ".venv", create = true }
+
+[tasks.install]
+description = "Install Python dependencies into the project virtualenv"
+run = "uv pip install pytest"
+
+[tasks.test]
+description = "Run the test suite"
+depends = ["install"]
+run = "pytest"

@@ -1,1 +1,10 @@
 .DS_Store
+
+# Mise-managed project toolchain (Issue #1).
+.venv/
+.mise/
+
+# Python test/cache artifacts.
+.pytest_cache/
+__pycache__/
+*.py[cod]
