@@ -12,8 +12,8 @@ python = "3.14"
 _.python.venv = { path = ".venv", create = true }
 
 [tasks.install]
-description = "Install Python dependencies into the project virtualenv"
-run = "uv pip install pytest"
+description = "Install MetaCrucible (editable) and dev dependencies into the project virtualenv"
+run = "uv pip install -e \".[dev]\""
 
 [tasks.test]
 description = "Run the test suite"
