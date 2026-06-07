@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from . import __version__
+from .benchmark import SPLIT_EVAL, SPLIT_HELD_OUT
+from .promote import promote_case
 from .storage import RepositoryStorage
 
 __all__ = ["main"]
@@ -79,6 +81,45 @@ def _build_parser() -> argparse.ArgumentParser:
         help="validate an existing workspace without creating files",
     )
     init_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="emit a parseable JSON object on stdout",
+    )
+    promote_parser = subparsers.add_parser(
+        "promote",
+        help="promote a generated benchmark case after human review",
+    )
+    promote_parser.add_argument(
+        "workspace",
+        help="path to the artifact workspace",
+    )
+    promote_parser.add_argument(
+        "--case-id",
+        required=True,
+        help="case_id of the generated benchmark case to promote",
+    )
+    promote_parser.add_argument(
+        "--split",
+        choices=[SPLIT_EVAL, SPLIT_HELD_OUT],
+        required=True,
+        help="reviewed split to assign to the promoted case",
+    )
+    promote_parser.add_argument(
+        "--reviewed-by",
+        required=True,
+        help="human reviewer identity to record on the case",
+    )
+    promote_parser.add_argument(
+        "--review-note",
+        default="",
+        help="human review note to record on the case",
+    )
+    promote_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="rewrite benchmark.jsonl; default is dry-run",
+    )
+    promote_parser.add_argument(
         "--json",
         action="store_true",
         help="emit a parseable JSON object on stdout",
@@ -243,6 +284,23 @@ def _emit(payload: dict[str, Any], *, as_json: bool) -> None:
         else:
             print(f"{key}: {value}")
 
+def cmd_promote(args: argparse.Namespace) -> int:
+    """Run the ``promote`` subcommand; return the process exit code."""
+    workspace = Path(args.workspace).resolve()
+    benchmark = workspace / BENCHMARK_FILE_NAME
+    result = promote_case(
+        benchmark,
+        case_id=args.case_id,
+        split=args.split,
+        reviewed_by=args.reviewed_by,
+        review_note=args.review_note,
+        reviewed_at=_now_iso(),
+        dry_run=not args.apply,
+    )
+    _emit(result, as_json=args.json)
+    return 0 if not result["blockers"] else CHECK_BLOCKED_EXIT_CODE
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     """Run the ``init`` subcommand; return the process exit code."""
     workspace = Path(args.workspace).resolve()
@@ -296,6 +354,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0 if code is None else int(code)
     if getattr(args, "command", None) == "init":
         return cmd_init(args)
+    if getattr(args, "command", None) == "promote":
+        return cmd_promote(args)
     return 0
 
 
