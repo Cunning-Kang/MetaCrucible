@@ -1540,4 +1540,223 @@ def test_record_provider_run_outcome_accepts_openai_shape(
         f"cost={record.get('cost')!r}"
     )
 
+# --------------------------------------------------------------------------- #
+# Issue #19: provider error taxonomy + bounded retry policy                   #
+# --------------------------------------------------------------------------- #
+# Issue #19 + ADR 0034: every provider call must go through a stable error
+# taxonomy (transient / auth / context overflow / safety refusal / unknown)
+# and a bounded retry policy. Transient errors are the only ones that get
+# retried; auth, context overflow, and safety refusal are terminal. Every
+# retry leaves a public record in the result's ``retries`` list so a
+# downstream receipt/evidence recorder can correlate the retries with the
+# final outcome — the evidence is never hidden in logs only.
+
+# Mapping from semantic category to the public error class and the stable
+# blocker id the retry function must emit. Centralizing the mapping keeps
+# the slice-2 parametrized test and the production code in lockstep.
+_NON_RETRYABLE_ERROR_CASES: dict[str, tuple[str, str]] = {
+    "auth": ("ProviderAuthError", "PROVIDER_AUTH_BLOCKER"),
+    "context_overflow": (
+        "ProviderContextOverflowError", "PROVIDER_CONTEXT_OVERFLOW_BLOCKER"
+    ),
+    "safety_refusal": (
+        "ProviderSafetyRefusalError", "PROVIDER_SAFETY_REFUSAL_BLOCKER"
+    ),
+}
+
+
+def test_call_provider_with_retry_retries_transient_errors(
+    provider_config: Any,
+) -> None:
+    """Issue #19 AC1: a transient provider error is retried.
+
+    A fake ``call_fn`` that raises ``ProviderTransientError`` twice and
+    then returns a value must be retried until it succeeds. The result
+    must report ``ok=True``, the returned value, and the total number
+    of attempts (1 initial + N retries). The retry must be bounded by
+    ``max_attempts``; no infinite loops are allowed.
+    """
+    calls: list[int] = []
+
+    def call_fn() -> dict[str, str]:
+        calls.append(len(calls) + 1)
+        if len(calls) < 3:
+            raise provider_config.ProviderTransientError(
+                f"transient failure #{len(calls)}"
+            )
+        return {"result": "ok"}
+
+    result = provider_config.call_provider_with_retry(
+        call_fn, max_attempts=5
+    )
+    assert isinstance(result, dict), (
+        f"call_provider_with_retry must return a dict result; got "
+        f"{type(result).__name__}"
+    )
+    assert result.get("ok") is True, (
+        f"transient errors must be retried; got result={result!r}"
+    )
+    assert result.get("value") == {"result": "ok"}, (
+        f"value must be the successful call_fn return; got "
+        f"{result.get('value')!r}"
+    )
+    assert result.get("attempts") == 3, (
+        f"transient retry-then-success must yield attempts=3 "
+        f"(2 failures + 1 success); got {result.get('attempts')!r}"
+    )
+    assert len(calls) == 3, (
+        f"call_fn must be invoked exactly 3 times; got {len(calls)} calls"
+    )
+
+
+@pytest.mark.parametrize(
+    "category",
+    sorted(_NON_RETRYABLE_ERROR_CASES.keys()),
+    ids=sorted(_NON_RETRYABLE_ERROR_CASES.keys()),
+)
+def test_call_provider_with_retry_does_not_retry_non_transient_errors(
+    provider_config: Any, category: str
+) -> None:
+    """Issue #19 AC2: auth/context-overflow/safety-refusal are not retried.
+
+    A fake ``call_fn`` that raises one of the non-retryable
+    provider error classes must be invoked exactly once. The
+    result must report ``ok=False``, ``attempts == 1``, and a
+    stable blocker id identifying the error category. The retry
+    policy must never silently retry these categories.
+    """
+    error_class_name, blocker_const_name = _NON_RETRYABLE_ERROR_CASES[category]
+    error_cls = getattr(provider_config, error_class_name)
+    expected_blocker_id = getattr(provider_config, blocker_const_name)
+
+    calls: list[int] = []
+
+    def call_fn() -> None:
+        calls.append(1)
+        raise error_cls(f"non-retryable {category}")
+
+    result = provider_config.call_provider_with_retry(
+        call_fn, max_attempts=5
+    )
+    assert isinstance(result, dict), (
+        f"call_provider_with_retry must return a dict result; got "
+        f"{type(result).__name__}"
+    )
+    assert result.get("ok") is False, (
+        f"{error_class_name} must yield ok=False; got result={result!r}"
+    )
+    assert result.get("attempts") == 1, (
+        f"{error_class_name} must NOT be retried (attempts=1); got "
+        f"{result.get('attempts')!r}"
+    )
+    assert len(calls) == 1, (
+        f"call_fn must be invoked exactly once for {error_class_name}; "
+        f"got {len(calls)} calls"
+    )
+    blockers = result.get("blockers")
+    assert isinstance(blockers, list) and blockers, (
+        f"non-retryable {error_class_name} must emit at least one blocker; "
+        f"got {blockers!r}"
+    )
+    blocker_ids = [
+        b.get("id") for b in blockers if isinstance(b, dict)
+    ]
+    assert expected_blocker_id in blocker_ids, (
+        f"non-retryable {error_class_name} must emit blocker id "
+        f"{expected_blocker_id!r}; got {blocker_ids!r}"
+    )
+    for blocker in blockers:
+        assert isinstance(blocker, dict), (
+            f"every blocker must be a dict; got {type(blocker).__name__}"
+        )
+        assert (
+            isinstance(blocker.get("id"), str) and blocker["id"]
+        ), (
+            f"every blocker must have a non-empty id; got {blocker!r}"
+        )
+        assert (
+            isinstance(blocker.get("message"), str)
+            and blocker["message"]
+        ), (
+            f"every blocker must carry a non-empty message; got "
+            f"{blocker!r}"
+        )
+
+
+def test_call_provider_with_retry_records_retry_evidence(
+    provider_config: Any,
+) -> None:
+    """Issue #19 AC3: retry evidence is recorded on the public result.
+
+    When a transient error is retried until the bounded budget
+    is exhausted, every attempt must leave a record in the
+    result's ``retries`` list. Each record exposes the attempt
+    number, the error category, the error class name, and the
+    error message. The evidence is part of the public result —
+    a downstream receipt/evidence recorder can read it without
+    scraping logs.
+    """
+    def call_fn() -> None:
+        raise provider_config.ProviderTransientError("boom")
+
+    result = provider_config.call_provider_with_retry(
+        call_fn, max_attempts=3
+    )
+    assert isinstance(result, dict), (
+        f"call_provider_with_retry must return a dict result; got "
+        f"{type(result).__name__}"
+    )
+    assert result.get("ok") is False, (
+        f"persistent transient errors must yield ok=False; got "
+        f"result={result!r}"
+    )
+    assert result.get("attempts") == 3, (
+        f"max_attempts=3 must yield attempts=3; got "
+        f"{result.get('attempts')!r}"
+    )
+    retries = result.get("retries")
+    assert isinstance(retries, list), (
+        f"retry evidence must be exposed as a 'retries' list on the "
+        f"public result (Issue #19 AC3); got {retries!r}"
+    )
+    assert len(retries) == 3, (
+        f"retries list must have one entry per attempt; got "
+        f"{len(retries)} entries for attempts=3"
+    )
+    for i, entry in enumerate(retries, start=1):
+        assert isinstance(entry, dict), (
+            f"each retry evidence entry must be a dict; got "
+            f"{type(entry).__name__}"
+        )
+        assert entry.get("attempt") == i, (
+            f"retry evidence entry must carry its attempt number; got "
+            f"entry={entry!r} at index {i-1}"
+        )
+        assert entry.get("category") == "transient", (
+            f"retry evidence must record the error category; got "
+            f"entry={entry!r}"
+        )
+        assert entry.get("error_class") == "ProviderTransientError", (
+            f"retry evidence must record the error class name; got "
+            f"entry={entry!r}"
+        )
+        assert entry.get("message") == "boom", (
+            f"retry evidence must record the error message; got "
+            f"entry={entry!r}"
+        )
+    blockers = result.get("blockers")
+    assert isinstance(blockers, list) and blockers, (
+        f"retry-exhausted failure must emit a blocker; got {blockers!r}"
+    )
+    blocker_ids = [
+        b.get("id") for b in blockers if isinstance(b, dict)
+    ]
+    assert (
+        provider_config.PROVIDER_RETRY_EXHAUSTED_BLOCKER in blocker_ids
+    ), (
+        f"retry-exhausted must emit blocker id "
+        f"{provider_config.PROVIDER_RETRY_EXHAUSTED_BLOCKER!r}; got "
+        f"{blocker_ids!r}"
+    )
+
 

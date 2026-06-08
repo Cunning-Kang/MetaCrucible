@@ -59,6 +59,16 @@ __all__ = [
     "resolve_provider_config",
     "run_structured_output_probe",
     "call_structured",
+    "call_provider_with_retry",
+    "ProviderError",
+    "ProviderTransientError",
+    "ProviderAuthError",
+    "ProviderContextOverflowError",
+    "ProviderSafetyRefusalError",
+    "PROVIDER_AUTH_BLOCKER",
+    "PROVIDER_CONTEXT_OVERFLOW_BLOCKER",
+    "PROVIDER_SAFETY_REFUSAL_BLOCKER",
+    "PROVIDER_RETRY_EXHAUSTED_BLOCKER",
     "record_provider_run_outcome",
 ]
 
@@ -132,6 +142,19 @@ COST_MISSING_WARNING: str = "provider-cost-missing"
 # any consumer of state.json that branches on the provider_usage
 # shape.
 PROVIDER_USAGE_SCHEMA_VERSION: int = 1
+# Stable blocker ids emitted by :func:`call_provider_with_retry`
+# (Issue #19, ADR 0034). The retry function emits exactly one
+# of these on a terminal failure; tests and downstream automation
+# branch on the values verbatim; renaming any value is a
+# breaking change and must be paired with a migration plan.
+PROVIDER_AUTH_BLOCKER: str = "provider-auth-error"
+PROVIDER_CONTEXT_OVERFLOW_BLOCKER: str = "provider-context-overflow-error"
+PROVIDER_SAFETY_REFUSAL_BLOCKER: str = "provider-safety-refusal-error"
+# Emitted when a transient error persists past the bounded
+# retry budget. Distinct from the non-retryable blockers above
+# so a downstream receipt/evidence recorder can tell "we tried
+# and gave up" apart from "we refused to try".
+PROVIDER_RETRY_EXHAUSTED_BLOCKER: str = "provider-retry-exhausted"
 # Stable mapping from semantic key to stable warning id. Mirrors
 # :data:`EXPECTED_BLOCKERS` for the warning side. Callers and
 # downstream automation branch on the values verbatim; renaming
@@ -142,6 +165,10 @@ EXPECTED_BLOCKERS: dict[str, str] = {
     "runtime_leak": RUNTIME_ADAPTER_LEAK_BLOCKER,
     "structured_output_probe": STRUCTURED_OUTPUT_PROBE_BLOCKER,
     "structured_output_schema": STRUCTURED_OUTPUT_SCHEMA_VALIDATION_BLOCKER,
+    "provider_auth": PROVIDER_AUTH_BLOCKER,
+    "provider_context_overflow": PROVIDER_CONTEXT_OVERFLOW_BLOCKER,
+    "provider_safety_refusal": PROVIDER_SAFETY_REFUSAL_BLOCKER,
+    "provider_retry_exhausted": PROVIDER_RETRY_EXHAUSTED_BLOCKER,
 }
 EXPECTED_WARNINGS: dict[str, str] = {
     "usage_missing": USAGE_MISSING_WARNING,
@@ -1101,4 +1128,223 @@ def record_provider_run_outcome(
         "warnings": warnings,
         "blockers": [],
     }
+
+# --------------------------------------------------------------------------- #
+# Public: provider error taxonomy + bounded retry policy                     #
+#          (Issue #19, ADR 0034)                                              #
+# --------------------------------------------------------------------------- #
+#
+# Issue #19 + ADR 0034 pin a small stable taxonomy of provider errors and a
+# bounded retry policy:
+#
+#   * Transient errors (rate limit, timeout, unavailable) are the ONLY
+#     category that gets retried. The retry budget is bounded by
+#     ``max_attempts``; no infinite loops.
+#   * Auth, context overflow, safety refusal, and unknown / non-transient
+#     errors are terminal. They are returned to the caller with a stable
+#     blocker id and a populated ``retries`` evidence list, but the
+#     ``call_fn`` is NOT invoked again.
+#   * Every attempt — successful or not — leaves a public record in the
+#     result's ``retries`` list so a downstream receipt/evidence recorder
+#     can correlate retries with the final outcome. The evidence is part
+#     of the public result, not hidden in logs.
+#
+# The taxonomy is a small class hierarchy rooted at :class:`ProviderError`
+# so callers can ``except ProviderTransientError`` to handle retries and
+# ``except ProviderError`` to handle the rest. The class names are part of
+# the public surface; renaming them is a breaking change.
+
+
+class ProviderError(Exception):
+    """Base class for all provider errors (Issue #19, ADR 0034).
+
+    Every error a provider SDK or transport layer raises should
+    be wrapped in a :class:`ProviderError` subclass so the retry
+    policy can classify it. The base class is intentionally bare
+    (just an ``Exception``) so a bare ``except ProviderError``
+    catches every provider-originated failure.
+    """
+class ProviderTransientError(ProviderError):
+    """Transient provider error — retry with backoff.
+
+    Use for rate limits, timeouts, temporary unavailability, and
+    other failures the caller expects to resolve on a subsequent
+    attempt. The retry policy in :func:`call_provider_with_retry`
+    is the ONLY place that catches and retries this category.
+    """
+
+
+class ProviderAuthError(ProviderError):
+    """Authentication / authorization error — do not retry.
+
+    The provider rejected the request because the credential is
+    missing, invalid, or unauthorized. Retrying with the same
+    credential will only produce the same failure, so the retry
+    policy treats this category as terminal and surfaces the
+    :data:`PROVIDER_AUTH_BLOCKER` blocker.
+    """
+
+
+class ProviderContextOverflowError(ProviderError):
+    """Context-window overflow error — do not retry.
+
+    The request exceeded the model's context window. Retrying
+    with the same input will fail again; the caller must shrink
+    the prompt, summarize history, or pick a different model.
+    The retry policy treats this category as terminal and
+    surfaces the :data:`PROVIDER_CONTEXT_OVERFLOW_BLOCKER`
+    blocker.
+    """
+
+
+class ProviderSafetyRefusalError(ProviderError):
+    """Safety / policy refusal error — do not retry.
+
+    The provider refused the request on safety or policy
+    grounds. Retrying verbatim will reproduce the same refusal;
+    the caller must reword the request or pick a different
+    route. The retry policy treats this category as terminal
+    and surfaces the :data:`PROVIDER_SAFETY_REFUSAL_BLOCKER`
+    blocker.
+    """
+
+
+
+def call_provider_with_retry(
+    call_fn: Callable[..., Any],
+    *,
+    max_attempts: int = 3,
+) -> dict[str, Any]:
+    """Call ``call_fn`` with bounded retry on transient provider errors.
+
+    Issue #19 + ADR 0034: a small stable retry policy for provider
+    calls. The policy is intentionally boring:
+
+      * Retries ONLY :class:`ProviderTransientError`. Auth, context
+        overflow, safety refusal, and unknown errors propagate or
+        are returned as terminal failures — they are never retried.
+      * The retry budget is bounded by ``max_attempts`` (total
+        number of invocations, including the first). ``max_attempts
+        < 1`` is clamped to ``1`` so a misconfigured caller still
+        gets exactly one attempt and a clear failure result.
+      * The function never raises. Every outcome is a result dict.
+
+    Slice 1 (Issue #19 AC1) covers the transient retry path. The
+    non-retryable categories and the ``retries`` evidence list are
+    added by later slices; this function is the single entry point
+    that will own all of them.
+
+    Parameters
+    ----------
+    call_fn:
+        Zero-argument callable invoked once per attempt. Any
+        non-``ProviderError`` exception is allowed to propagate
+        (caller's contract violation, not a retry signal).
+    max_attempts:
+        Total number of attempts (including the first). ``1`` means
+        "one call, no retry"; ``3`` (the default) means "one
+        initial call plus up to two retries". The value is
+        clamped to a minimum of ``1`` so a misconfigured caller
+        still gets exactly one attempt.
+    """
+    if max_attempts < 1:
+        max_attempts = 1
+    attempts = 0
+    retries: list[dict[str, Any]] = []
+    while True:
+        attempts += 1
+        try:
+            value = call_fn()
+        except ProviderAuthError as exc:
+            retries.append({
+                "attempt": attempts,
+                "category": "auth",
+                "error_class": "ProviderAuthError",
+                "message": str(exc),
+            })
+            return {
+                "ok": False,
+                "value": None,
+                "attempts": attempts,
+                "retries": retries,
+                "blockers": [_blocker(
+                    PROVIDER_AUTH_BLOCKER,
+                    (
+                        f"provider auth error after {attempts} attempt(s); "
+                        f"auth failures are terminal and not retried "
+                        f"(Issue #19, ADR 0034): {exc}"
+                    ),
+                )],
+            }
+        except ProviderContextOverflowError as exc:
+            retries.append({
+                "attempt": attempts,
+                "category": "context_overflow",
+                "error_class": "ProviderContextOverflowError",
+                "message": str(exc),
+            })
+            return {
+                "ok": False,
+                "value": None,
+                "attempts": attempts,
+                "retries": retries,
+                "blockers": [_blocker(
+                    PROVIDER_CONTEXT_OVERFLOW_BLOCKER,
+                    (
+                        f"provider context overflow after {attempts} attempt(s); "
+                        f"context-overflow failures are terminal and not "
+                        f"retried (Issue #19, ADR 0034): {exc}"
+                    ),
+                )],
+            }
+        except ProviderSafetyRefusalError as exc:
+            retries.append({
+                "attempt": attempts,
+                "category": "safety_refusal",
+                "error_class": "ProviderSafetyRefusalError",
+                "message": str(exc),
+            })
+            return {
+                "ok": False,
+                "value": None,
+                "attempts": attempts,
+                "retries": retries,
+                "blockers": [_blocker(
+                    PROVIDER_SAFETY_REFUSAL_BLOCKER,
+                    (
+                        f"provider safety refusal after {attempts} attempt(s); "
+                        f"safety refusals are terminal and not retried "
+                        f"(Issue #19, ADR 0034): {exc}"
+                    ),
+                )],
+            }
+        except ProviderTransientError as exc:
+            retries.append({
+                "attempt": attempts,
+                "category": "transient",
+                "error_class": "ProviderTransientError",
+                "message": str(exc),
+            })
+            if attempts >= max_attempts:
+                return {
+                    "ok": False,
+                    "value": None,
+                    "attempts": attempts,
+                    "retries": retries,
+                    "blockers": [_blocker(
+                        PROVIDER_RETRY_EXHAUSTED_BLOCKER,
+                        (
+                            f"transient provider error persisted after "
+                            f"{attempts} attempt(s); bounded retry budget "
+                            f"exhausted (Issue #19, ADR 0034)"
+                        ),
+                    )],
+                }
+            continue
+        return {
+            "ok": True,
+            "value": value,
+            "attempts": attempts,
+            "retries": retries,
+        }
 
