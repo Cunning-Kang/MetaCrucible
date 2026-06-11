@@ -49,7 +49,7 @@ from .exit_codes import (
     EXIT_USER_ERROR,
 )
 from .promote import promote_case
-from .storage import RepositoryStorage
+from .storage import RepositoryStorage, UserGlobalStorage
 
 __all__ = ["main"]
 
@@ -107,6 +107,19 @@ def _build_parser() -> argparse.ArgumentParser:
             "skip copy-on-write workspace masking (Issue #13); "
             "requires --confirm-no-isolation and a TTY, or the "
             "METACRUCIBLE_ALLOW_NO_ISOLATION=1 env-var override"
+        ),
+    )
+    init_parser.add_argument(
+        "--review",
+        dest="review_artifact",
+        default=None,
+        metavar="ARTIFACT_FILE",
+        help=(
+            "read a capability artifact file, run the static review "
+            "profiles against its parsed body, and write a receipt + "
+            "summary + trajectory digest to the user-global evidence "
+            "store (Issue #28 tracer bullet). The artifact is read "
+            "only; the source bytes are never mutated."
         ),
     )
     init_parser.add_argument(
@@ -295,6 +308,216 @@ def _check_workspace(workspace: Path) -> dict[str, Any]:
     }
 
 
+def _parse_artifact_source(
+    source: str, *, artifact_path: Path
+) -> tuple[str, Any]:
+    """Parse ``source`` as a subagent-first, then-Skill artifact.
+
+    The parser API is :func:`parse_subagent` and :func:`parse_skill`
+    (Issue #4). Subagents and Skills share the frontmatter shape but
+    differ in field semantics (subagents add ``tools``/``spawns``/
+    ``systemPrompt``); we try subagent first and fall back to Skill
+    so the caller's filename is informational, not a contract.
+    """
+    from . import artifact as _artifact
+    from .artifact import parse_skill, parse_subagent
+
+    try:
+        parsed = parse_subagent(source)
+        return ("subagent", parsed)
+    except ValueError:
+        try:
+            parsed = parse_skill(source)
+            return ("skill", parsed)
+        except ValueError:
+            raise ValueError(
+                f"artifact {artifact_path} is not a recognized Skill or "
+                f"subagent source; frontmatter is missing or malformed "
+                f"(see {_artifact.__name__})"
+            ) from None
+
+
+def _run_static_review(
+    *,
+    workspace: Path,
+    artifact_path: Path,
+) -> dict[str, Any]:
+    """Read ``artifact_path`` and write a v1 evidence bundle.
+
+    Tracer-bullet pipeline (Issue #28 acceptance):
+
+      1. Read the artifact source bytes (read-only — caller must not
+         pass a path the CLI would write to; we never mutate the
+         source).
+      2. Parse via the existing :mod:`metacrucible.artifact` parser.
+      3. Feed the parsed body into the existing static-review
+         profile surfaces (``evaluate_secret_privacy_risk``,
+         ``evaluate_runtime_neutrality``) plus the harness-identity
+         helper ``compute_evaluation_harness_sha``. No new review
+         semantics are invented here.
+      4. Aggregate per-profile results through
+         :func:`evaluate_acceptance` (the existing verdict
+         primitive).
+      5. Persist the receipt, summary, and trajectory digest via
+         the existing :class:`UserGlobalStorage` writers, which run
+         the payload through :func:`build_receipt_payload`,
+         :func:`build_summary_payload`, and
+         :func:`build_trajectory_digest_payload` (v1 contracts).
+
+    Returns the path map so the caller can surface it through
+    ``--json`` / human output. On a missing artifact file, raises
+    ``FileNotFoundError``; on a malformed source, raises
+    ``ValueError`` (a ``BLOCKED`` bundle is not written for
+    pre-pipeline failures — the CLI maps the exception to
+    ``EXIT_USER_ERROR``).
+    """
+    from .profiles import (
+        BUILTIN_PROFILES,
+        evaluate_acceptance,
+        evaluate_runtime_neutrality,
+        evaluate_secret_privacy_risk,
+        compute_evaluation_harness_sha,
+    )
+
+    source_bytes = artifact_path.read_bytes()
+    # Decode for the parser; the source is runtime-native Markdown
+    # (per ADR 0005), so UTF-8 is the right contract. A
+    # ``UnicodeDecodeError`` is a user-input error, not a BLOCKED
+    # condition.
+    try:
+        source_text = source_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            f"artifact {artifact_path} is not valid UTF-8: {exc}"
+        ) from exc
+
+    kind, parsed = _parse_artifact_source(source_text, artifact_path=artifact_path)
+
+    # Build the review input mapping. The static-review profiles
+    # read ``body`` and ``portability.target``; we project the
+    # parsed artifact into that shape without inventing new
+    # review semantics. ``routing_touched`` follows the parsed
+    # routing surface (Issue #21 / ADR 0033): if the artifact
+    # declares any routing-surface field, treat the surface as
+    # touched for the purposes of trigger selection.
+    body = parsed.body
+    if hasattr(parsed, "frontmatter") and isinstance(parsed.frontmatter, dict):
+        # Subagent artifacts expose a ``systemPrompt`` mutable range
+        # that the secret-privacy scanner also wants to see. The
+        # framework's existing ``body`` field is the contract; we
+        # concatenate the system prompt so the scanner sees the full
+        # surface it would see in a real run.
+        system_prompt = parsed.frontmatter.get("systemPrompt")
+        if isinstance(system_prompt, str) and system_prompt:
+            body = system_prompt + "\n" + body
+    review_input: dict[str, Any] = {
+        "body": body,
+        "portability": {"target": "runtime_neutral"},
+        "reviewed_fake_secrets": (),
+    }
+
+    secret_result = evaluate_secret_privacy_risk(review_input)
+    runtime_result = evaluate_runtime_neutrality(review_input)
+
+    # Trigger selection: secret-privacy-risk is hard-coded for every
+    # run; routing-surface-safety is triggered when routing was
+    # touched (we keep it informational here — the static-review
+    # tracer bullet is about wiring, not verdict policy).
+    routing_touched = bool(getattr(parsed, "routing_surface", frozenset()))
+    spec_index = {spec.id: spec for spec in BUILTIN_PROFILES}
+    triggered_ids = {secret_result.profile_id, runtime_result.profile_id}
+    if routing_touched:
+        # Surface routing-safety as a triggered profile so the
+        # harness identity digest matches what a real run would
+        # hash. The per-profile result is still whatever the
+        # profile produced; we do not invent a verdict.
+        from .profiles import evaluate_routing_surface_safety
+        routing_result = evaluate_routing_surface_safety(
+            {"routing_changes": list(getattr(parsed, "routing_surface", ()))}
+        )
+        profile_results = [secret_result, runtime_result, routing_result]
+        triggered_ids.add(routing_result.profile_id)
+    else:
+        profile_results = [secret_result, runtime_result]
+
+    verdict = evaluate_acceptance(
+        profile_results,
+        profile_specs=spec_index,
+    )
+    harness_sha = compute_evaluation_harness_sha(
+        tuple(spec_index[pid] for pid in sorted(triggered_ids))
+    )
+
+    # Persist the three durable bundle files via the existing v1
+    # builders / writers. No new schema is invented.
+    run_id = f"init-review-{_now_iso().replace(':', '').replace('-', '')}"
+    global_store = UserGlobalStorage()
+
+    receipt_payload: dict[str, Any] = {
+        "run_id": run_id,
+        "run_type": "init-review",
+        "status": "PASS" if verdict["accepted"] else "BLOCKED",
+        "artifact": str(artifact_path),
+        "artifact_kind": kind,
+        "envelope": str(workspace / ".metacrucible" / "envelope.json"),
+        "evaluation_harness": harness_sha,
+        "blockers": verdict["blockers"],
+    }
+    receipt_path = global_store.write_receipt(run_id, receipt_payload)
+
+    summary_payload: dict[str, Any] = {
+        "status": receipt_payload["status"],
+        "blockers": verdict["blockers"],
+        "counts": {
+            "profiles_run": len(profile_results),
+            "blockers": len(verdict["blockers"]),
+            "supplemental_findings": len(verdict["supplemental_findings"]),
+        },
+    }
+    summary_path = global_store.write_summary(run_id, summary_payload)
+
+    trajectory_steps: list[dict[str, Any]] = [
+        {
+            "step": 0,
+            "action": "parse_artifact",
+            "status": "PASS",
+            "kind": kind,
+        },
+        {
+            "step": 1,
+            "action": "static_review",
+            "status": receipt_payload["status"],
+            "profile_ids": [r.profile_id for r in profile_results],
+        },
+    ]
+    for idx, blocker in enumerate(verdict["blockers"]):
+        trajectory_steps.append(
+            {
+                "step": 2 + idx,
+                "action": "blocker",
+                "status": "BLOCKED",
+                "blocker": blocker,
+            }
+        )
+    digest_payload: dict[str, Any] = {
+        "run_id": run_id,
+        "artifact": str(artifact_path),
+        "steps": trajectory_steps,
+    }
+    digest_path = global_store.write_trajectory_digest(run_id, digest_payload)
+
+    return {
+        "artifact_path": str(artifact_path),
+        "artifact_kind": kind,
+        "run_id": run_id,
+        "receipt_path": str(receipt_path),
+        "summary_path": str(summary_path),
+        "trajectory_digest_path": str(digest_path),
+        "accepted": verdict["accepted"],
+        "blockers": verdict["blockers"],
+    }
+
+
 def _emit(payload: dict[str, Any], *, as_json: bool) -> None:
     """Write ``payload`` to stdout in JSON or human form.
 
@@ -393,6 +616,19 @@ def cmd_init(args: argparse.Namespace) -> int:
             _emit(payload, as_json=args.json)
             return EXIT_BLOCKED
     paths = _create_workspace(workspace)
+    # Optional static-review tracer bullet (Issue #28). The flag is
+    # opt-in so the default ``init`` contract is unchanged; when
+    # set, the helper reads the artifact, parses it, runs the
+    # existing static-review profiles, and writes a v1 evidence
+    # bundle to the user-global store. The source artifact is
+    # never written to.
+    review_report: dict[str, Any] | None = None
+    if getattr(args, "review_artifact", None):
+        artifact_path = Path(args.review_artifact).resolve()
+        review_report = _run_static_review(
+            workspace=workspace,
+            artifact_path=artifact_path,
+        )
     # Boundary report (ADR 0031, Issue #13 AC1). When
     # ``--no-isolation`` is set the gate above has already passed,
     # so masking is intentionally skipped and the report is
@@ -417,6 +653,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         "created": paths["created"],
         "boundary_report": boundary_report,
     }
+    if review_report is not None:
+        payload["review"] = review_report
     _emit(payload, as_json=args.json)
     return EXIT_OK
 

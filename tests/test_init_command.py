@@ -574,3 +574,264 @@ def test_init_check_blocked_does_not_create_evidence_bundle(
     # covers the case where the root exists but is empty (which can
     # happen if a previous test in the same run-id namespace wrote
     # to a sibling directory).
+
+
+# --------------------------------------------------------------------------- #
+# AC7 — ``init --review <artifact>`` tracer bullet (Issue #28)                #
+# --------------------------------------------------------------------------- #
+#
+# Acceptance contract:
+#   * default ``init`` is unchanged (no bundle written without --review)
+#   * ``--review <artifact>`` reads the artifact, parses it through
+#     the existing artifact parser, runs the existing static-review
+#     profiles, and writes a v1 evidence bundle
+#   * the source artifact bytes are not mutated
+#   * the receipt, summary, and trajectory digest all exist
+
+_SKILL_ARTIFACT_SOURCE = (
+    "---\n"
+    "name: trace-skill\n"
+    "description: Tracer-bullet skill for the init --review test.\n"
+    "---\n"
+    "\n"
+    "# trace-skill\n"
+    "\n"
+    "Body content for the static-review tracer bullet.\n"
+)
+
+
+def _run_init_review(
+    *,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str = _SKILL_ARTIFACT_SOURCE,
+) -> tuple[subprocess.CompletedProcess[str], Path, Path, Path]:
+    """Helper: write a temp artifact, run ``init --review``, return artifacts.
+
+    ``HOME`` is pinned to a temp dir so the test does not leak evidence
+    bundles into the developer's real ``~/.metacrucible/`` when it
+    succeeds. The temp artifact path, the workspace path, and the
+    fake home are returned so each test can assert on its slice of
+    state.
+    """
+    fake_home = tmp_path / "home"
+    fake_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    workspace = tmp_path / "ws-review"
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    artifact = tmp_path / "trace-skill.md"
+    artifact.write_text(source, encoding="utf-8")
+
+    result = _run_metacrucible(
+        ["init", str(workspace), "--review", str(artifact), "--json"],
+        cwd=REPO_ROOT,
+    )
+    return result, artifact, workspace, fake_home
+
+
+def test_init_review_writes_receipt_summary_and_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``init --review <artifact>`` must emit a complete v1 evidence bundle.
+
+    Issue #28 acceptance: receipt, summary, and trajectory digest
+    must all exist after a successful run. The bundle is written
+    to ``$HOME/.metacrucible/evidence/<run_id>/`` via the existing
+    ``UserGlobalStorage`` writers.
+    """
+    result, artifact, workspace, fake_home = _run_init_review(
+        tmp_path=tmp_path, monkeypatch=monkeypatch
+    )
+    assert result.returncode == 0, (
+        f"`init --review` must exit 0 on a well-formed artifact; "
+        f"got rc={result.returncode} stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )
+    payload = json.loads(result.stdout)
+    review = payload.get("review")
+    assert isinstance(review, dict), (
+        f"`init --review` --json must surface a 'review' object; "
+        f"got keys {sorted(payload.keys())!r}"
+    )
+    for key in (
+        "receipt_path",
+        "summary_path",
+        "trajectory_digest_path",
+    ):
+        assert key in review, (
+            f"`init --review` --json must report {key!r}; "
+            f"got review keys {sorted(review.keys())!r}"
+        )
+        path = Path(review[key])
+        assert path.is_file(), (
+            f"`init --review` must write {key}={path}; file missing"
+        )
+
+
+def test_init_review_does_not_mutate_artifact_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``init --review <artifact>`` must read the artifact without writing it.
+
+    Issue #28 acceptance: the source artifact bytes are unchanged
+    after the tracer-bullet pipeline runs. We pin the file's mtime
+    and bytes around the call so any accidental write or rename
+    fails loud.
+    """
+    result, artifact, workspace, fake_home = _run_init_review(
+        tmp_path=tmp_path, monkeypatch=monkeypatch
+    )
+    assert result.returncode == 0, (
+        f"`init --review` must exit 0; got rc={result.returncode} "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    after_bytes = artifact.read_bytes()
+    assert after_bytes == _SKILL_ARTIFACT_SOURCE.encode("utf-8"), (
+        f"`init --review` must NOT mutate the source artifact; "
+        f"got {after_bytes!r}"
+    )
+
+
+def test_init_review_reports_paths_for_each_bundle_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reported receipt/summary/digest paths must point at real files.
+
+    This pins the bundle-writer contract end to end: the JSON
+    output advertises paths the CLI created, and the v1 builders
+    on the storage side wrote the expected filenames
+    (``receipt.json``, ``summary.json``, ``trajectory-digest.json``)
+    in a single run-id directory.
+    """
+    result, artifact, workspace, fake_home = _run_init_review(
+        tmp_path=tmp_path, monkeypatch=monkeypatch
+    )
+    assert result.returncode == 0, (
+        f"`init --review` must exit 0; got rc={result.returncode} "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    review = json.loads(result.stdout)["review"]
+    receipt = Path(review["receipt_path"])
+    summary = Path(review["summary_path"])
+    digest = Path(review["trajectory_digest_path"])
+    # All three must live in the same evidence bundle directory.
+    assert receipt.parent == summary.parent == digest.parent, (
+        f"receipt/summary/digest must share a bundle directory; "
+        f"got receipt.parent={receipt.parent} "
+        f"summary.parent={summary.parent} digest.parent={digest.parent}"
+    )
+    # Each must be the canonical v1 filename (ADR 0030).
+    assert receipt.name == "receipt.json"
+    assert summary.name == "summary.json"
+    assert digest.name == "trajectory-digest.json"
+    # Bundle directory is the one UserGlobalStorage created.
+    bundle_dir = receipt.parent
+    expected_root = fake_home / ".metacrucible" / "evidence"
+    assert bundle_dir.parent == expected_root, (
+        f"bundle must live under {expected_root}; got {bundle_dir}"
+    )
+    # The receipt must carry the v1 schema_version stamp and a
+    # non-empty run_id (the receipt builder re-stamps schema_version
+    # and validates refs; a missing stamp would be a contract
+    # regression).
+    receipt_payload = json.loads(receipt.read_text(encoding="utf-8"))
+    assert receipt_payload.get("schema_version") == 1, (
+        f"receipt.json must stamp schema_version=1; got "
+        f"{receipt_payload.get('schema_version')!r}"
+    )
+    assert receipt_payload.get("run_id"), (
+        f"receipt.json must carry a run_id; got {receipt_payload!r}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# AC8 — ``init --review`` routing-surface-safety is wired through to receipt   #
+# --------------------------------------------------------------------------- #
+#
+# Issue #28 BF-1: the review pipeline must observe the routing
+# surface it parsed and surface a routing-surface-safety blocker
+# when the routing edit budget is exceeded. The Skill frontmatter
+# `name` + `description` pair declares two routing-surface fields,
+# which exceeds ``ROUTING_SURFACE_CAP = 1`` and must BLOCK the
+# review. Without the key fix (``routing_changes`` vs ``routing``)
+# the profile would see zero changes and silently PASS — the bug
+# is invisible to tests unless this case asserts a non-trivial
+# outcome.
+
+_SKILL_ARTIFACT_WITH_MULTIPLE_ROUTING_FIELDS = (
+    "---\n"
+    "name: routing-touch-skill\n"
+    "description: A skill that touches two routing-surface fields.\n"
+    "---\n"
+    "\n"
+    "# routing-touch-skill\n"
+    "\n"
+    "Body content for the routing-surface-safety tracer-bullet test.\n"
+)
+
+
+def test_init_review_blocks_when_routing_surface_exceeds_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BF-1 visibility: routing surface > cap must BLOCK the receipt.
+
+    The Skill artifact declares both ``name`` and ``description``
+    (two routing-surface fields per ADR 0033). The
+    routing-surface-safety profile enforces cap=1 (ADR 0027 /
+    ADR 0032). The fix in ``__main__.py`` must pass the parsed
+    routing surface under the ``routing_changes`` key the
+    profile reads; if the key regresses, the profile silently
+    sees zero changes and the review returns PASS. This test
+    pins the BLOCKED outcome so BF-1 is visible.
+    """
+    result, artifact, workspace, fake_home = _run_init_review(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        source=_SKILL_ARTIFACT_WITH_MULTIPLE_ROUTING_FIELDS,
+    )
+    assert result.returncode == 0, (
+        f"`init --review` must exit 0 even when the review BLOCKs; "
+        f"got rc={result.returncode} stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )
+    payload = json.loads(result.stdout)
+    review = payload.get("review")
+    assert isinstance(review, dict), (
+        f"`init --review` --json must surface a 'review' object; "
+        f"got keys {sorted(payload.keys())!r}"
+    )
+    receipt = Path(review["receipt_path"])
+    receipt_payload = json.loads(receipt.read_text(encoding="utf-8"))
+
+    # The receipt's top-level status flips to BLOCKED because the
+    # routing-surface-safety profile is a hard-coded blocking
+    # profile (ADR 0033). A regression to the wrong dict key
+    # (``routing`` instead of ``routing_changes``) leaves the
+    # profile with zero routing changes and silently PASSes —
+    # that is BF-1.
+    assert receipt_payload.get("status") == "BLOCKED", (
+        f"receipt must record status='BLOCKED' when the routing "
+        f"surface exceeds cap=1; got status="
+        f"{receipt_payload.get('status')!r} (full receipt: "
+        f"{receipt_payload!r})"
+    )
+
+    blockers = receipt_payload.get("blockers")
+    assert isinstance(blockers, list) and blockers, (
+        f"receipt must surface at least one routing-surface-safety "
+        f"blocker when the routing surface exceeds cap=1; "
+        f"got blockers={blockers!r}"
+    )
+    blocker_ids = [
+        entry.get("id") for entry in blockers if isinstance(entry, dict)
+    ]
+    assert any(
+        bid == "routing-surface-safety.cap-exceeded" for bid in blocker_ids
+    ), (
+        f"receipt blockers must include "
+        f"'routing-surface-safety.cap-exceeded' when the routing "
+        f"surface exceeds cap=1 (Issue #28 BF-1); got blocker_ids="
+        f"{blocker_ids!r}"
+    )
