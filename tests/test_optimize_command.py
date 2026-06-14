@@ -1818,3 +1818,309 @@ def test_split_artifact_text_matches_parser_frontmatter_split() -> None:
             f"from parser; parser={parser_body!r} "
             f"optimizer={opt_body!r}"
         )
+
+
+# --------------------------------------------------------------------------- #
+# Issue #34: bounded Patch Revision applier contract (ADR 0037)             #
+# --------------------------------------------------------------------------- #
+
+
+def test_optimize_ac1_ranked_edit_budget_selects_four_non_routing_edits_and_rejects_fifth() -> None:
+    """AC1 (issue #34 / ADR 0037): the default per-round edit
+    budget is :data:`RANKED_EDIT_BUDGET` (= 4). Five non-routing
+    edit suggestions on the body's ``range_id=0`` (each with a
+    distinct ``intent`` so the LLM-provided order is meaningful)
+    must select exactly four and reject the fifth with the
+    budget blocker.
+
+    Mechanics:
+
+      - The deterministic ``call_fn`` returns a
+        ``round_reflection`` with five ``suggested_edits`` whose
+        ``replacement`` is a distinct non-empty string.
+      - The pipeline clips the selected set to four (the
+        default :data:`RANKED_EDIT_BUDGET`).
+      - The fifth suggestion lands in ``rejected`` with
+        ``reason_id == MUTABLE_RANGE_CONFLICT_BLOCKER`` and the
+        "per-round budget exceeded" reason text.
+      - The artifact on disk is unchanged because the round is
+        blocked by the merge-plan / budget gate before
+        ``apply_patch_revision``.
+    """
+    from metacrucible.optimizer import (
+        MUTABLE_RANGE_CONFLICT_BLOCKER,
+        RANKED_EDIT_BUDGET,
+        run_optimizer_pipeline,
+    )
+
+    assert RANKED_EDIT_BUDGET == 4, (
+        f"AC1 contract: RANKED_EDIT_BUDGET must be 4 in the "
+        f"bounded Patch Revision applier; got {RANKED_EDIT_BUDGET!r}"
+    )
+
+    workspace = _tmp_workspace()
+    benchmark = workspace / BENCHMARK_FILE_NAME
+    artifact = _opt9_seed_artifact(workspace)
+    _opt9_seed_envelope(workspace, artifact)
+    _write_jsonl(
+        benchmark,
+        [
+            _metadata_record(),
+            _reviewed_case("eval-1", split="eval"),
+            _reviewed_case("held-1", split="held_out"),
+        ],
+    )
+
+    body_hash = _opt9_body_hash()
+
+    def _five_non_routing_edits(
+        *, repair_context: Any = None
+    ) -> dict[str, Any]:
+        return {
+            "rationale": "AC1: five non-routing edits to trip the budget",
+            "suggested_edits": [
+                {
+                    "range_id": 0,
+                    "base_hash": body_hash,
+                    "intent": f"ac1_intent_{idx}",
+                    "replacement": f"# body\nAC1 edit {idx}\n",
+                    "rationale": f"non-routing edit #{idx}",
+                    "routing": False,
+                }
+                for idx in range(5)
+            ],
+        }
+
+    def _ac1_eval_call_fn(case: Mapping[str, Any]) -> Mapping[str, Any]:
+        return {"status": "PASS", "case_id": case.get("case_id", "")}
+
+    result = run_optimizer_pipeline(
+        workspace=workspace,
+        benchmark_path=benchmark,
+        artifact_path=artifact,
+        call_fn=_five_non_routing_edits,
+        max_rounds=1,
+        human_confirmed=False,
+        eval_call_fn=_ac1_eval_call_fn,
+    )
+
+    records = _opt9_read_history(workspace)
+    ranked_records = _opt9_find_records(records, "ranked_edit_set")
+    assert ranked_records, (
+        f"pipeline must persist a ranked_edit_set record; "
+        f"got {len(ranked_records)} records"
+    )
+    last_ranked = ranked_records[-1]
+    selected = last_ranked.get("selected") or []
+    rejected = last_ranked.get("rejected") or []
+    assert len(selected) == 4, (
+        f"AC1: default budget is 4 so the selected set must "
+        f"contain exactly 4 entries; got len(selected)={len(selected)} "
+        f"selected={selected!r}"
+    )
+    budget_rejections = [
+        r for r in rejected
+        if isinstance(r, dict)
+        and r.get("reason_id") == MUTABLE_RANGE_CONFLICT_BLOCKER
+        and "budget" in str(r.get("reason", "")).lower()
+    ]
+    assert budget_rejections, (
+        f"AC1: the fifth suggestion must be rejected with the "
+        f"budget blocker; got rejected={rejected!r}"
+    )
+    # The fifth (last) suggestion must appear in rejected.
+    rejected_ids = {r.get("suggestion_id") for r in rejected}
+    expected_fifth = f"round-01-sug-04"
+    assert expected_fifth in rejected_ids, (
+        f"AC1: the fifth suggestion (id={expected_fifth!r}) "
+        f"must be in rejected; got rejected_ids={rejected_ids!r}"
+    )
+    # The artifact must remain the seeded bytes because the
+    # round was blocked before apply.
+    expected_artifact_bytes = (
+        b"---\nname: opt9-skill\n"
+        b"description: OPT-9 contract regression fixture\n"
+        b"---\n# body\nThe body is the only mutable range.\n"
+    )
+    assert artifact.read_bytes() == expected_artifact_bytes, (
+        f"AC1: a budget-blocked round must NOT mutate the "
+        f"artifact; expected={expected_artifact_bytes!r} "
+        f"actual={artifact.read_bytes()!r}"
+    )
+    # The run must end BLOCKED (the merge-plan gate tripped
+    # because empty/budget-blocked selected set is empty).
+    assert result.status == "BLOCKED", (
+        f"AC1: budget-exceeded round must exit BLOCKED; got "
+        f"status={result.status!r}"
+    )
+
+
+def test_optimize_ac3_single_suggestion_empty_replacement_blocks_round_without_write() -> None:
+    """AC3 single-suggestion path (issue #34 / ADR 0037):
+    a selected non-routing suggestion with ``replacement == ""``
+    must mark ``RangeMergePlan.merge_outside_mutable_range``
+    True, emit :data:`MUTABLE_RANGE_CONFLICT_BLOCKER`, and leave
+    the artifact bytes unchanged.
+
+    The pipeline injects ``call_fn`` returning a single
+    ``round_reflection`` whose ``suggested_edits`` has one entry
+    whose ``replacement`` is the empty string. The merge plan
+    flips ``merge_outside_mutable_range=True`` (the
+    ``fits = bool(replacement)`` check is False), the runner
+    appends :data:`MUTABLE_RANGE_CONFLICT_BLOCKER`, the round
+    blocks before ``apply_patch_revision``, and the seeded
+    artifact bytes are preserved.
+    """
+    from metacrucible.optimizer import (
+        MUTABLE_RANGE_CONFLICT_BLOCKER,
+        run_optimizer_pipeline,
+    )
+
+    workspace = _tmp_workspace()
+    benchmark = workspace / BENCHMARK_FILE_NAME
+    artifact = _opt9_seed_artifact(workspace)
+    _opt9_seed_envelope(workspace, artifact)
+    _write_jsonl(
+        benchmark,
+        [
+            _metadata_record(),
+            _reviewed_case("eval-1", split="eval"),
+            _reviewed_case("held-1", split="held_out"),
+        ],
+    )
+
+    body_hash = _opt9_body_hash()
+
+    def _empty_replacement_call_fn(
+        *, repair_context: Any = None
+    ) -> dict[str, Any]:
+        return {
+            "rationale": "AC3: empty replacement must block the round",
+            "suggested_edits": [
+                {
+                    "range_id": 0,
+                    "base_hash": body_hash,
+                    "intent": "ac3_empty_replacement",
+                    "replacement": "",
+                    "rationale": "non-routing edit with empty body",
+                    "routing": False,
+                }
+            ],
+        }
+
+    def _ac3_eval_call_fn(case: Mapping[str, Any]) -> Mapping[str, Any]:
+        return {"status": "PASS", "case_id": case.get("case_id", "")}
+
+    result = run_optimizer_pipeline(
+        workspace=workspace,
+        benchmark_path=benchmark,
+        artifact_path=artifact,
+        call_fn=_empty_replacement_call_fn,
+        max_rounds=1,
+        human_confirmed=False,
+        eval_call_fn=_ac3_eval_call_fn,
+    )
+
+    records = _opt9_read_history(workspace)
+    plan_records = _opt9_find_records(records, "range_merge_plan")
+    assert plan_records, (
+        f"AC3: pipeline must persist a range_merge_plan record "
+        f"even when the merge is outside the mutable range; "
+        f"got {len(plan_records)} records"
+    )
+    last_plan = plan_records[-1]
+    assert last_plan.get("merge_outside_mutable_range") is True, (
+        f"AC3: empty replacement must flip "
+        f"merge_outside_mutable_range; got "
+        f"plan={last_plan!r}"
+    )
+    # The result blockers must include MUTABLE_RANGE_CONFLICT_BLOCKER.
+    blocker_ids = {b.get("id") for b in (result.blockers or [])}
+    assert MUTABLE_RANGE_CONFLICT_BLOCKER in blocker_ids, (
+        f"AC3: blockers must include "
+        f"{MUTABLE_RANGE_CONFLICT_BLOCKER!r}; got "
+        f"blocker_ids={blocker_ids!r}"
+    )
+    # The artifact must be unchanged.
+    expected_artifact_bytes = (
+        b"---\nname: opt9-skill\n"
+        b"description: OPT-9 contract regression fixture\n"
+        b"---\n# body\nThe body is the only mutable range.\n"
+    )
+    assert artifact.read_bytes() == expected_artifact_bytes, (
+        f"AC3: a merge-outside-range round must NOT mutate the "
+        f"artifact; expected={expected_artifact_bytes!r} "
+        f"actual={artifact.read_bytes()!r}"
+    )
+    assert result.status == "BLOCKED", (
+        f"AC3: merge-outside-range round must exit BLOCKED; "
+        f"got status={result.status!r}"
+    )
+
+
+def test_optimize_ac3_merge_same_range_fits_false_marks_plan_outside_mutable_range() -> None:
+    """AC3 LLM-merge unit test (issue #34 / ADR 0037):
+    :func:`_merge_same_range_suggestions` invoked with a
+    deterministic ``call_fn`` returning ``fits_in_range=False``
+    (and a non-empty replacement) must return a dict whose
+    ``fits_in_range`` is ``False`` so the caller
+    :func:`_build_merge_plan` flips
+    ``merge_outside_mutable_range=True`` and the round blocks.
+    :func:`run_optimizer_pipeline` round-trip) so the assertion
+    pins the contract independent of upstream selection.
+    """
+    from metacrucible.optimizer import _merge_same_range_suggestions
+
+    body_hash = _opt9_body_hash()
+    from metacrucible.optimizer import (
+        EditSuggestion,
+        _merge_same_range_suggestions,
+    )
+
+    sugg = EditSuggestion(
+        record_type="edit_suggestion",
+        suggestion_id="ac3-unit-sug-00",
+        run_id="ac3-unit",
+        round_id="round-01",
+        timestamp="2026-06-14T00:00:00Z",
+        range_id=0,
+        base_hash=body_hash,
+        intent="ac3_merge_fits_false",
+        replacement="merged replacement",
+        rationale="unit test fixture",
+        routing=False,
+        human_confirmed=False,
+        routing_field="",
+    )
+
+    def _fits_false_call_fn(
+        *, repair_context: Any = None, **kwargs: Any
+    ) -> dict[str, Any]:
+        return {
+            "replacement": "merged replacement",
+            "fits_in_range": False,
+            "rationale": "merge self-reports outside-range",
+        }
+
+    merged = _merge_same_range_suggestions(
+        range_id=0,
+        base_text=_opt9_body_text(),
+        suggestions=[sugg],
+        call_fn=_fits_false_call_fn,
+        provider_name="test-provider",
+        provider_spec={},
+        model="test-model",
+    )
+    assert isinstance(merged, dict), (
+        f"_merge_same_range_suggestions must return a dict; "
+        f"got type={type(merged).__name__}"
+    )
+    assert merged.get("fits_in_range") is False, (
+        f"AC3 LLM-merge unit: fits_in_range=False from the "
+        f"call_fn must propagate through the helper; got "
+        f"merged={merged!r}"
+    )
+    assert merged.get("replacement") == "merged replacement", (
+        f"AC3 LLM-merge unit: replacement must be the merged "
+        f"text from the call_fn; got merged={merged!r}"
+    )

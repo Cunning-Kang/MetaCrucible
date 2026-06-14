@@ -103,7 +103,7 @@ ROUND_BUDGET_DEFAULT: int = 1
 #: (routing or non-routing) per round. The cap is a hard upper
 #: bound: any candidate revision that exceeds the cap is
 #: rejected before conflict checks.
-RANKED_EDIT_BUDGET: int = 1
+RANKED_EDIT_BUDGET: int = 4
 
 #: Stable blocker id emitted when a structured provider response
 #: (case_reflection, round_reflection, edit_suggestion) fails JSON
@@ -884,13 +884,9 @@ def _check_routing_violations(
 ) -> list[dict[str, str]]:
     """Return blockers for routing cap / HITL / unsupported range.
 
-    Three rules:
-
-      1. At most :data:`RANKED_EDIT_BUDGET` (= 1) selected
+      1. At most :data:`ROUTING_SURFACE_CAP` (= 1) selected
          routing edit per round (ADR 0027 / ADR 0032).
       2. A routing edit must carry ``human_confirmed=True`` or
-         the operator passed ``--confirm-routing`` (the
-         ``context.human_confirmed`` field).
       3. A routing edit must target a routing-surface field
          (``context.routing_surface_fields``); a routing edit
          outside the routing surface is contradictory intent.
@@ -938,10 +934,12 @@ def _check_range_overlap(
     :func:`_merge_same_range_suggestions` path) or block the
     round. We block before the merge call: the merge step is
     only invoked when the selected set has at most one
-    suggestion per range. (For the MVP one-edit budget this
-    check is degenerate; it stays in the contract for the
-    ``--max-rounds > 1`` and future ``RANKED_EDIT_BUDGET > 1``
-    configurations.)
+    suggestion per range. (This check matters once
+    :data:`RANKED_EDIT_BUDGET` >= 2 allows more than one
+    selected edit per round; with the budget above 1 a
+    same-range pair is reachable. The MVP one-edit budget
+    keeps the check degenerate; it stays in the contract for
+    ``--max-rounds > 1`` and the bounded multi-edit rounds.)
     """
     seen: dict[int, str] = {}
     blockers: list[dict[str, str]] = []
@@ -991,8 +989,7 @@ def _check_budget_violations(
     suggestions: Sequence[EditSuggestion],
 ) -> list[dict[str, str]]:
     """Return blockers when the selected set exceeds the per-round budget.
-
-    The :data:`RANKED_EDIT_BUDGET` (= 1) is the hard upper
+    The :data:`RANKED_EDIT_BUDGET` (= 4) is the hard upper
     bound: any candidate revision that exceeds the cap is
     rejected before conflict checks. The blocker id is the
     same machine-stable string the cap-exceeded check uses
@@ -1100,8 +1097,6 @@ def _merge_same_range_suggestions(
         "rationale": value.get("rationale") or "",
         "source_suggestion_ids": [s.suggestion_id for s in suggestions],
     }
-
-
 def _build_merge_plan(
     *,
     selected: Sequence[EditSuggestion],
@@ -1110,12 +1105,10 @@ def _build_merge_plan(
     provider_name: str,
     provider_spec: Mapping[str, Any],
     model: str,
+
 ) -> RangeMergePlan:
     """Build the per-range merge plan (OPT-5).
-
     For each selected ``range_id`` a single ``replacement``
-    is produced (one merge call when more than one
-    suggestion targets the range, the suggestion's
     ``replacement`` when only one does). The plan is
     deterministic; a same-range merge that produces text
     outside the mutable range flips
@@ -1143,10 +1136,14 @@ def _build_merge_plan(
             # base text; that is True ONLY for a no-op edit
             # and made every real improvement block the round.
             # The replacement is the bounded per-range text
-            # the optimizer intends to substitute; an empty
-            # replacement is the only invalid case.
+            # the optimizer intends to substitute; a
+            # non-string or empty replacement is the only
+            # invalid case (the per-range text must be a
+            # string for ``apply_patch_revision`` to
+            # substitute; the caller marks the plan
+            # outside the mutable range and blocks).
             replacement = suggs[0].replacement
-            fits = bool(replacement)
+            fits = isinstance(replacement, str) and bool(replacement)
             per_range[range_id] = {
                 "replacement": replacement,
                 "fits_in_range": fits,
