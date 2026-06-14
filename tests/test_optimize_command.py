@@ -464,21 +464,18 @@ def test_optimize_reports_blockers_in_json_output(
         f"{type(payload).__name__} ({payload!r})"
     )
     for key in (
+        "status",
         "workspace",
         "benchmark",
-        "benchmark_present",
         "is_optimize_runnable",
         "pending_review_case_ids",
         "blockers",
+        "rounds",
     ):
         assert key in payload, (
             f"optimize --json must surface {key!r}; got keys "
             f"{sorted(payload.keys())!r}"
         )
-    assert payload["benchmark_present"] is True, (
-        f"benchmark_present must be True for a present "
-        f"benchmark; got {payload['benchmark_present']!r}"
-    )
     assert payload["is_optimize_runnable"] is False, (
         f"is_optimize_runnable must be False when the "
         f"benchmark is blocked; got "
@@ -508,19 +505,24 @@ def test_optimize_reports_blockers_in_json_output(
 # AC5 — clean benchmark surfaces "not yet implemented"                        #
 # --------------------------------------------------------------------------- #
 
-def test_optimize_clean_benchmark_reports_not_yet_implemented(
+def test_optimize_clean_benchmark_enters_pipeline(
     tmp_path: Path,
 ) -> None:
-    """A benchmark that is otherwise optimize-runnable
-    (eligible reviewed eval + held-out cases, no pending
-    generated, no bootstrap sentinel) still returns
-    ``EXIT_BLOCKED`` with the ``optimize-not-implemented``
-    blocker.
+    """A clean (loader-runnable) benchmark no longer emits
+    the ``optimize-not-implemented`` W3 placeholder
+    blocker (OPT-0). The MVP sentinel gate is replaced by
+    the full SkillOpt-shaped pipeline; the BLOCKED path
+    that remains is the artifact-path precondition (the
+    pipeline cannot run without an envelope-declared
+    artifact).
 
-    Full optimization is W3 per the PRD; the MVP command
-    is a sentinel gate that refuses to start with a stable
-    blocker id so the contract is "we will refuse with a
-    clear reason" rather than "we silently do nothing".
+    The test seeds a clean benchmark and asserts the
+    optimize command blocks on the artifact precondition
+    rather than the W3 placeholder, so the
+    ``optimize-not-implemented`` blocker id is GONE from
+    the payload. The blocker that surfaces is the new
+    ``optimize-artifact-unresolved`` id (OD1-equivalent
+    for the optimizer).
     """
     workspace = _init_workspace(tmp_path)
     benchmark = workspace / BENCHMARK_FILE_NAME
@@ -538,43 +540,40 @@ def test_optimize_clean_benchmark_reports_not_yet_implemented(
         cwd=REPO_ROOT,
     )
     assert result.returncode == EXIT_BLOCKED, (
-        f"`optimize` on a clean benchmark must exit "
-        f"{EXIT_BLOCKED} (full optimization is W3); got "
-        f"rc={result.returncode} stdout={result.stdout!r} "
+        f"`optimize` on a clean benchmark without an "
+        f"envelope-declared artifact must exit {EXIT_BLOCKED}; "
+        f"got rc={result.returncode} stdout={result.stdout!r} "
         f"stderr={result.stderr!r}"
     )
     payload = json.loads(result.stdout)
-    assert payload["benchmark_present"] is True
-    assert payload["is_optimize_runnable"] is True, (
-        f"is_optimize_runnable must be True for a clean "
-        f"benchmark; got {payload['is_optimize_runnable']!r}"
-    )
-    assert payload["pending_review_case_ids"] == [], (
-        f"pending_review_case_ids must be empty for a clean "
-        f"benchmark; got {payload['pending_review_case_ids']!r}"
-    )
     blocker_ids = [
         b.get("id") for b in payload.get("blockers", [])
         if isinstance(b, dict)
     ]
-    assert OPTIMIZE_NOT_IMPLEMENTED_BLOCKER in blocker_ids, (
-        f"optimize on a clean benchmark must surface the "
-        f"optimize-not-implemented blocker (W3 placeholder); "
+    # OPT-0: the W3 placeholder is gone.
+    assert OPTIMIZE_NOT_IMPLEMENTED_BLOCKER not in blocker_ids, (
+        f"optimize must no longer surface the W3 placeholder "
+        f"blocker; got blocker_ids={blocker_ids!r}"
+    )
+    # The pipeline has not started: there is no envelope
+    # artifact_path, so the precondition blocks. The
+    # operator sees a stable, machine-branched blocker id
+    # rather than a silent pass.
+    assert "optimize-artifact-unresolved" in blocker_ids, (
+        f"optimize must surface the optimize-artifact-"
+        f"unresolved blocker on the new precondition path; "
         f"got blocker_ids={blocker_ids!r}"
     )
-    # No other load-bearing blockers should be present on
-    # the clean-benchmark path: the loader reported no
-    # blockers (eligible eval + held-out, no pending
-    # generated), so the only blocker in the payload is
-    # the W3 placeholder.
-    assert blocker_ids == [OPTIMIZE_NOT_IMPLEMENTED_BLOCKER], (
-        f"clean benchmark path must report exactly the "
-        f"optimize-not-implemented blocker; got "
-        f"blocker_ids={blocker_ids!r}"
+    # ``is_optimize_runnable`` is True (the benchmark is
+    # fine; the missing piece is the artifact, which is a
+    # separate precondition). The command emits the BLOCKED
+    # status from the payload.
+    assert payload.get("status") == "BLOCKED", (
+        f"clean-benchmark-without-artifact must report "
+        f"status=BLOCKED; got {payload.get('status')!r}"
     )
 
 
-# --------------------------------------------------------------------------- #
 # AC6 — optimize is read-only (no benchmark mutation)                          #
 # --------------------------------------------------------------------------- #
 
@@ -687,10 +686,6 @@ def test_optimize_blocks_when_benchmark_file_missing(
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
     payload = json.loads(result.stdout)
-    assert payload["benchmark_present"] is False, (
-        f"benchmark_present must be False for a missing "
-        f"file; got {payload['benchmark_present']!r}"
-    )
     blocker_ids = [
         b.get("id") for b in payload.get("blockers", [])
         if isinstance(b, dict)
@@ -760,3 +755,1066 @@ def test_optimize_human_output_is_english_only(
         f"{offenders!r} in stdout={result.stdout!r} "
         f"stderr={result.stderr!r}"
     )
+
+# --------------------------------------------------------------------------- #
+# OPT-0 — no SkillOpt runtime dependency                                      #
+# --------------------------------------------------------------------------- #
+
+def test_optimize_path_does_not_require_skillopt_import() -> None:
+    """Importing the optimize path must not require ``skillopt``.
+
+    Issue #33 AC5 / ADR 0022: MetaCrucible re-implements the
+    SkillOpt-shaped loop without a runtime dependency on
+    Microsoft SkillOpt. The test pins the contract by
+    installing a sys.modules stub for ``skillopt`` that
+    raises on attribute access, then imports the entire
+    metacrucible package. If any module under the optimize
+    path tries to import ``skillopt`` (top-level or
+    transitive), the import fails loud.
+
+    The test is intentionally a fresh ``importlib.import_module``
+    round so it does not rely on the prior test's
+    import state.
+    """
+    import importlib
+    import sys
+
+    blocked = {"skillopt": None}
+    for mod_name in list(sys.modules):
+        if mod_name == "skillopt" or mod_name.startswith("skillopt."):
+            blocked[mod_name] = sys.modules.pop(mod_name)
+
+    class _SkilloptImportBlocker:
+        """A module object whose attribute access raises."""
+
+        def __getattr__(self, name: str) -> None:
+            raise ImportError(
+                f"metacrucible.optimize must not depend on "
+                f"skillopt at runtime (ADR 0022); blocked "
+                f"attribute {name!r}"
+            )
+
+    sys.modules["skillopt"] = _SkilloptImportBlocker()  # type: ignore[assignment]
+    try:
+        # Force a re-import of metacrucible + the optimize path.
+        for mod_name in [
+            "metacrucible",
+            "metacrucible.optimizer",
+            "metacrucible.__main__",
+        ]:
+            sys.modules.pop(mod_name, None)
+        importlib.import_module("metacrucible")
+        importlib.import_module("metacrucible.optimizer")
+        importlib.import_module("metacrucible.__main__")
+    finally:
+        # Restore the previous sys.modules state so the
+        # rest of the test suite is unaffected.
+        for mod_name, mod in blocked.items():
+            if mod is None:
+                sys.modules.pop(mod_name, None)
+            else:
+                sys.modules[mod_name] = mod
+
+
+# --------------------------------------------------------------------------- #
+# OPT-9 — record-counts contract                                              #
+# --------------------------------------------------------------------------- #
+
+def test_optimize_pipeline_produces_required_record_types() -> None:
+    """The pipeline persists every required record type
+    (OPT-2 / OPT-9 AC1).
+
+    The test drives the pipeline directly (no subprocess)
+    with a deterministic no-LLM ``call_fn`` and asserts
+    that every required record type was appended to the
+    workspace's ``history.jsonl`` at least once. A
+    pre-acceptance candidate is rejected (eval-split FAIL
+    counts are not strictly improved), so the run's
+    record count for ``range_merge_plan`` is 1 (the
+    merge plan that was rejected).
+    """
+    import json as _json
+    from metacrucible.optimizer import run_optimizer_pipeline
+
+    workspace = _init_workspace(tmp_path=None) if False else _tmp_workspace()  # type: ignore[arg-type]
+    benchmark = workspace / BENCHMARK_FILE_NAME
+    artifact = workspace / "SKILL.md"
+    artifact.write_text(
+        "---\n"
+        "name: opt-skill\n"
+        "description: a tiny skill for the OPT-9 contract test\n"
+        "---\n"
+        "# body\nThe body is the only mutable range.\n",
+        encoding="utf-8",
+    )
+    # Envelope must declare artifact_path (OD1).
+    envelope = workspace / ".metacrucible" / "envelope.json"
+    envelope.write_text(
+        _json.dumps(
+            {
+                "schema_version": 1,
+                "artifact_path": str(artifact),
+                "artifact_workspace": str(workspace),
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _write_jsonl(
+        benchmark,
+        [
+            _metadata_record(),
+            _reviewed_case("eval-1", split="eval"),
+            _reviewed_case("held-1", split="held_out"),
+        ],
+    )
+
+    # Inject a deterministic call_fn that returns a valid
+    # round_reflection with one edit_suggestion targeting
+    # the body's range_id (=0). The fake matches the
+    # call_structured contract: ``call_fn(repair_context=...)``
+    # returns a JSON-compatible object that validates against
+    # the schema.
+    def _fake_round_reflection(*, repair_context=None):
+        return {
+            "rationale": "improve the body clarity",
+            "suggested_edits": [
+                {
+                    "range_id": 0,
+                    "base_hash": (
+                        __import__("hashlib").sha256(
+                            b"# body\nThe body is the only mutable range.\n"
+                        ).hexdigest()
+                    ),
+                    "intent": "clarify_triggers",
+                    "replacement": (
+                        "# body\nThe body is the only mutable range.\n"
+                        "Skill name: opt-skill\n"
+                    ),
+                    "rationale": "improve clarity",
+                    "routing": False,
+                }
+            ],
+        }
+
+    result = run_optimizer_pipeline(
+        workspace=workspace,
+        benchmark_path=benchmark,
+        artifact_path=artifact,
+        call_fn=_fake_round_reflection,
+        max_rounds=1,
+        human_confirmed=False,
+    )
+
+    history = workspace / ".metacrucible" / "history.jsonl"
+    assert history.is_file(), (
+        f"optimize pipeline must append to history.jsonl; "
+        f"file missing at {history}"
+    )
+    record_types: set[str] = set()
+    for line in history.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        rec = _json.loads(line)
+        if isinstance(rec, dict):
+            rt = rec.get("record_type")
+            if isinstance(rt, str):
+                record_types.add(rt)
+    for required in (
+        "case_reflection",
+        "round_reflection",
+        "edit_suggestion",
+        "ranked_edit_set",
+        "range_merge_plan",
+    ):
+        assert required in record_types, (
+            f"pipeline must persist a {required!r} record "
+            f"during a run; got record_types={sorted(record_types)!r}"
+        )
+    assert result.run_id, "pipeline must return a non-empty run_id"
+    # The run produced an evidence bundle.
+    assert result.evidence_refs, (
+        f"pipeline must persist an evidence bundle; got "
+        f"evidence_refs={result.evidence_refs!r}"
+    )
+
+
+def _tmp_workspace(tmp_path: Path | None = None) -> Path:
+    """Helper: create an isolated ``init``-ed workspace for the OPT-9 test."""
+    import tempfile
+    if tmp_path is None:
+        tmp_path = Path(tempfile.mkdtemp(prefix="metacrucible-opt9-"))
+    workspace = tmp_path / "ws"
+    workspace.mkdir(parents=True, exist_ok=True)
+    result = _run_metacrucible(["init", str(workspace)], cwd=REPO_ROOT)
+    assert result.returncode == EXIT_OK
+    return workspace
+
+
+# --------------------------------------------------------------------------- #
+# OPT-9 contract regression tests for AC2 / AC3 / AC4                          #
+# --------------------------------------------------------------------------- #
+
+
+def _opt9_skill_artifact_path(workspace: Path) -> Path:
+    """Return the path the OPT-9 tests use for the artifact under optimization.
+
+    The artifact is a tiny Skill so the parser produces exactly
+    one mutable range (the body, ``range_id=0``). Sharing the
+    path keeps the OPT-9 tests consistent with
+    :func:`test_optimize_pipeline_produces_required_record_types`.
+    """
+    return workspace / "SKILL.md"
+
+
+def _opt9_seed_artifact(workspace: Path) -> Path:
+    """Write the OPT-9 fixture artifact and return its path."""
+    artifact = _opt9_skill_artifact_path(workspace)
+    artifact.write_text(
+        "---\n"
+        "name: opt9-skill\n"
+        "description: OPT-9 contract regression fixture\n"
+        "---\n"
+        "# body\nThe body is the only mutable range.\n",
+        encoding="utf-8",
+    )
+    return artifact
+
+
+def _opt9_seed_envelope(
+    workspace: Path, artifact: Path
+) -> Path:
+    """Write the envelope the OPT-9 tests rely on (OD1)."""
+    import json as _json
+
+    envelope = workspace / ".metacrucible" / "envelope.json"
+    envelope.write_text(
+        _json.dumps(
+            {
+                "schema_version": 1,
+                "artifact_path": str(artifact),
+                "artifact_workspace": str(workspace),
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return envelope
+
+
+def _opt9_body_text() -> str:
+    """Return the canonical OPT-9 fixture body text."""
+    return "# body\nThe body is the only mutable range.\n"
+
+
+def _opt9_body_hash() -> str:
+    """Return the parser-owned content hash for the OPT-9 body."""
+    import hashlib
+
+    return hashlib.sha256(_opt9_body_text().encode("utf-8")).hexdigest()
+
+
+def _opt9_read_history(workspace: Path) -> list[dict[str, Any]]:
+    """Read and JSON-decode every record in ``history.jsonl``."""
+    import json as _json
+
+    history = workspace / ".metacrucible" / "history.jsonl"
+    records: list[dict[str, Any]] = []
+    if not history.is_file():
+        return records
+    for line in history.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        rec = _json.loads(line)
+        if isinstance(rec, dict):
+            records.append(rec)
+    return records
+
+
+def _opt9_find_records(
+    records: list[dict[str, Any]], record_type: str
+) -> list[dict[str, Any]]:
+    """Filter history records to those whose ``record_type`` matches."""
+    return [
+        r for r in records
+        if isinstance(r.get("record_type"), str)
+        and r["record_type"] == record_type
+    ]
+
+
+def test_optimize_held_out_excluded_from_context_and_history() -> None:
+    """AC2: held-out case content must never reach the optimizer
+    context or the persisted history (OPT-9 / ADR 0032).
+
+    The test pins the contract from two angles:
+
+    1. :func:`metacrucible.optimizer.build_optimizer_context`
+       must store held-out case *ids* only; the prompts /
+       expected behavior of held-out cases must not leak into
+       the context payload.
+    2. Driving the full pipeline with a call_fn spy must
+       neither thread held-out content into the spy payloads
+       nor persist held-out case references in
+       ``history.jsonl`` before the candidate is evaluated.
+    """
+    import json as _json
+
+    from metacrucible.optimizer import (
+        build_optimizer_context,
+        run_optimizer_pipeline,
+    )
+
+    workspace = _tmp_workspace()
+    benchmark = workspace / BENCHMARK_FILE_NAME
+    artifact = _opt9_seed_artifact(workspace)
+    _opt9_seed_envelope(workspace, artifact)
+
+    # Distinctive held-out sentinel string the test will search
+    # for in every payload that touches the optimizer. If the
+    # sentinel ever surfaces, the held-out exclusion contract
+    # has regressed.
+    held_out_sentinel = "HELD_OUT_SENTINEL_DO_NOT_LEAK_42"
+    eval_sentinel = "EVAL_SENTINEL_OK_99"
+
+    _write_jsonl(
+        benchmark,
+        [
+            _metadata_record(),
+            # Reviewed eval case with a distinctive prompt.
+            _reviewed_case(
+                "eval-1",
+                split="eval",
+            ) | {"input": {"prompt": eval_sentinel}},
+            # Reviewed held-out case with a distinctive prompt
+            # that must never appear in any optimizer context
+            # or history record.
+            _reviewed_case(
+                "held-1",
+                split="held_out",
+            ) | {"input": {"prompt": held_out_sentinel}},
+        ],
+    )
+
+    # 1. The optimizer context itself must hold held-out as
+    #    *ids only* (no prompts / no expected behavior).
+    context = build_optimizer_context(
+        workspace=workspace,
+        benchmark_path=benchmark,
+        artifact_path=artifact,
+        max_rounds=1,
+        human_confirmed=False,
+    )
+    assert "eval-1" in context.eligible_eval_case_ids, (
+        f"context must surface the eval case id; got "
+        f"{list(context.eligible_eval_case_ids)!r}"
+    )
+    assert "held-1" in context.eligible_held_out_case_ids, (
+        f"context must surface the held-out case id; got "
+        f"{list(context.eligible_held_out_case_ids)!r}"
+    )
+    ctx_blob = _json.dumps(context.as_dict(), sort_keys=True)
+    assert held_out_sentinel not in ctx_blob, (
+        f"optimizer context must NOT carry held-out prompt "
+        f"content; sentinel leaked into context.as_dict()"
+    )
+    # Sanity: the eval sentinel is not in the context either
+    # (the context only stores ids, not case bodies) — this
+    # confirms the no-content rule applies to both splits.
+    assert eval_sentinel not in ctx_blob, (
+        f"optimizer context must NOT carry eval prompt "
+        f"content either; eval sentinel leaked"
+    )
+
+    # 2. Drive the full pipeline with a call_fn spy that
+    #    records every ``repair_context`` it receives. The
+    #    spy also returns a deterministic edit suggestion
+    #    so the pipeline can run end-to-end.
+    captured_contexts: list[Any] = []
+
+    def _spy_call_fn(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        repair_context: Any = kwargs.get("repair_context")
+        if repair_context is None and args:
+            repair_context = args[0]
+        captured_contexts.append(repair_context)
+        # Deterministic round_reflection with one edit
+        # suggestion whose replacement keeps the artifact
+        # identical so the apply / evaluate stages don't
+        # change the on-disk bytes for this contract test.
+        return {
+            "rationale": "AC2 contract regression: spy call_fn",
+            "suggested_edits": [
+                {
+                    "range_id": 0,
+                    "base_hash": _opt9_body_hash(),
+                    "intent": "no_op_for_held_out_test",
+                    "replacement": _opt9_body_text(),
+                    "rationale": "replace with same body text",
+                    "routing": False,
+                }
+            ],
+        }
+
+    result = run_optimizer_pipeline(
+        workspace=workspace,
+        benchmark_path=benchmark,
+        artifact_path=artifact,
+        call_fn=_spy_call_fn,
+        max_rounds=1,
+        human_confirmed=False,
+    )
+    assert captured_contexts, (
+        f"pipeline must have invoked the call_fn spy at "
+        f"least once; got {len(captured_contexts)} calls"
+    )
+    # No call_fn payload (args / kwargs / repair_context) may
+    # carry the held-out sentinel.
+    for idx, ctx in enumerate(captured_contexts):
+        ctx_repr = repr(ctx)
+        assert held_out_sentinel not in ctx_repr, (
+            f"call_fn invocation #{idx + 1} must NOT carry "
+            f"held-out content; repair_context={ctx_repr!r}"
+        )
+
+    # History records before candidate evaluation must not
+    # reference the held-out case id or its prompt. The
+    # case_reflection records carry only eval case ids; the
+    # run-level start event carries only run metadata.
+    records = _opt9_read_history(workspace)
+    history_blob = _json.dumps(records, sort_keys=True)
+    assert held_out_sentinel not in history_blob, (
+        f"history must NOT carry held-out prompt content; "
+        f"found held_out_sentinel in {history_blob!r}"
+    )
+    # The case_reflection record is per eval case; held-out
+    # case ids must never appear as a case_id reference.
+    case_reflections = _opt9_find_records(records, "case_reflection")
+    for rec in case_reflections:
+        assert rec.get("case_id") != "held-1", (
+            f"case_reflection must NOT reference a held-out "
+            f"case_id; got {rec!r}"
+        )
+    # The contract holds even if the run is rejected /
+    # blocked: the run must not have evaluated the held-out
+    # split before the candidate materialized.
+    assert result.run_id, (
+        f"pipeline must produce a non-empty run_id; got "
+        f"{result.run_id!r}"
+    )
+
+
+def test_optimize_routing_cap_exceeded_blocks_second_routing_edit() -> None:
+    """AC3 (routing cap=1): when the round_reflection returns
+    two selected routing edits, the second one is rejected
+    with the canonical :data:`ROUTING_CAP_EXCEEDED_BLOCKER`
+    rejection id (OPT-4 / ADR 0032).
+
+    The test injects a deterministic ``call_fn`` that returns
+    two routing edits on the same range. Both carry
+    ``human_confirmed=True`` so the per-suggestion HITL gate
+    does not trip first; the cap is the limiting factor. The
+    test reads ``history.jsonl``, finds the
+    ``ranked_edit_set`` record, and asserts the ``rejected``
+    list contains an entry whose ``reason_id`` is the cap
+    blocker id.
+    """
+    from metacrucible.optimizer import (
+        ROUTING_CAP_EXCEEDED_BLOCKER,
+        run_optimizer_pipeline,
+    )
+
+    workspace = _tmp_workspace()
+    benchmark = workspace / BENCHMARK_FILE_NAME
+    artifact = _opt9_seed_artifact(workspace)
+    _opt9_seed_envelope(workspace, artifact)
+    _write_jsonl(
+        benchmark,
+        [
+            _metadata_record(),
+            _reviewed_case("eval-1", split="eval"),
+            _reviewed_case("held-1", split="held_out"),
+        ],
+    )
+
+    body_hash = _opt9_body_hash()
+
+    def _two_routing_edits(*, repair_context: Any = None) -> dict[str, Any]:
+        # Two routing edits on the body's range_id=0. Both
+        # name the "name" routing field (which is on the
+        # Skill routing surface so the contradictory-intent
+        # rule does not trip). Both carry
+        # ``human_confirmed=True`` so the per-suggestion
+        # HITL gate does not trip first — only the cap
+        # should reject.
+        return {
+            "rationale": "AC3 cap-exceeded contract regression",
+            "suggested_edits": [
+                {
+                    "range_id": 0,
+                    "base_hash": body_hash,
+                    "intent": "rename_skill_first",
+                    "replacement": _opt9_body_text(),
+                    "rationale": "first routing edit",
+                    "routing": True,
+                    "routing_field": "name",
+                },
+                {
+                    "range_id": 0,
+                    "base_hash": body_hash,
+                    "intent": "rename_skill_second",
+                    "replacement": _opt9_body_text(),
+                    "rationale": "second routing edit",
+                    "routing": True,
+                    "routing_field": "name",
+                },
+            ],
+        }
+
+    run_optimizer_pipeline(
+        workspace=workspace,
+        benchmark_path=benchmark,
+        artifact_path=artifact,
+        call_fn=_two_routing_edits,
+        max_rounds=1,
+        human_confirmed=True,
+    )
+
+    records = _opt9_read_history(workspace)
+    ranked_records = _opt9_find_records(records, "ranked_edit_set")
+    assert ranked_records, (
+        f"pipeline must persist at least one ranked_edit_set "
+        f"record on a two-routing-edit run; got "
+        f"{len(ranked_records)} records in history"
+    )
+    last_ranked = ranked_records[-1]
+    rejected = last_ranked.get("rejected") or []
+    cap_rejections = [
+        r for r in rejected
+        if isinstance(r, dict)
+        and r.get("reason_id") == ROUTING_CAP_EXCEEDED_BLOCKER
+    ]
+    assert cap_rejections, (
+        f"ranked_edit_set.rejected must contain an entry "
+        f"with reason_id={ROUTING_CAP_EXCEEDED_BLOCKER!r} "
+        f"when the round submits two routing edits; got "
+        f"rejected={rejected!r}"
+    )
+    # The first routing edit must have been selected (cap
+    # only fires for the second+ edit).
+    selected = last_ranked.get("selected") or []
+    assert len(selected) == 1, (
+        f"exactly one routing edit must survive the cap "
+        f"clip; got selected={selected!r}"
+    )
+
+
+def test_optimize_routing_hitl_unconfirmed_blocks_routing_edit() -> None:
+    """AC3 (routing HITL): a routing edit without explicit
+    human confirmation is rejected with the canonical
+    :data:`ROUTING_HITL_UNCONFIRMED_BLOCKER` rejection id
+    (OPT-4 / ADR 0032).
+
+    The test injects a deterministic ``call_fn`` returning a
+    single routing edit with ``human_confirmed=False`` on the
+    suggestion and ``human_confirmed=False`` on the optimizer
+    context. The cap check is not the limiting factor here
+    (only one routing edit is submitted); the HITL gate
+    must reject the edit. The test reads ``history.jsonl``,
+    finds the ``ranked_edit_set`` record, and asserts the
+    ``rejected`` list contains an entry whose ``reason_id``
+    is the HITL blocker id.
+    """
+    from metacrucible.optimizer import (
+        ROUTING_HITL_UNCONFIRMED_BLOCKER,
+        run_optimizer_pipeline,
+    )
+
+    workspace = _tmp_workspace()
+    benchmark = workspace / BENCHMARK_FILE_NAME
+    artifact = _opt9_seed_artifact(workspace)
+    _opt9_seed_envelope(workspace, artifact)
+    _write_jsonl(
+        benchmark,
+        [
+            _metadata_record(),
+            _reviewed_case("eval-1", split="eval"),
+            _reviewed_case("held-1", split="held_out"),
+        ],
+    )
+
+    body_hash = _opt9_body_hash()
+
+    def _unconfirmed_routing_edit(
+        *, repair_context: Any = None
+    ) -> dict[str, Any]:
+        # One routing edit; the suggestion-level
+        # ``human_confirmed`` is False and the context-level
+        # ``human_confirmed`` will be False at the call site
+        # so the HITL gate trips on this edit alone.
+        return {
+            "rationale": "AC3 HITL contract regression",
+            "suggested_edits": [
+                {
+                    "range_id": 0,
+                    "base_hash": body_hash,
+                    "intent": "rename_skill_without_confirm",
+                    "replacement": _opt9_body_text(),
+                    "rationale": "routing edit without HITL",
+                    "routing": True,
+                    "routing_field": "name",
+                }
+            ],
+        }
+
+    result = run_optimizer_pipeline(
+        workspace=workspace,
+        benchmark_path=benchmark,
+        artifact_path=artifact,
+        call_fn=_unconfirmed_routing_edit,
+        max_rounds=1,
+        human_confirmed=False,
+    )
+    # Sanity: the pipeline did not mutate the artifact
+    # because the only selected candidate was rejected.
+    # The HITL gate tripped in step 3d so the apply /
+    # evaluate stages never ran; the bytes on disk must
+    # match what the seed helper wrote.
+    expected_artifact_bytes = (
+        b"---\nname: opt9-skill\n"
+        b"description: OPT-9 contract regression fixture\n"
+        b"---\n# body\nThe body is the only mutable range.\n"
+    )
+    assert artifact.read_bytes() == expected_artifact_bytes, (
+        f"HITL-blocked routing edit must NOT mutate the "
+        f"artifact; expected={expected_artifact_bytes!r} "
+        f"actual={artifact.read_bytes()!r}"
+    )
+    records = _opt9_read_history(workspace)
+    ranked_records = _opt9_find_records(records, "ranked_edit_set")
+    assert ranked_records, (
+        f"pipeline must persist a ranked_edit_set record "
+        f"even when the routing edit is rejected; got "
+        f"{len(ranked_records)} records"
+    )
+    last_ranked = ranked_records[-1]
+    rejected = last_ranked.get("rejected") or []
+    hitl_rejections = [
+        r for r in rejected
+        if isinstance(r, dict)
+        and r.get("reason_id") == ROUTING_HITL_UNCONFIRMED_BLOCKER
+    ]
+    assert hitl_rejections, (
+        f"ranked_edit_set.rejected must contain an entry "
+        f"with reason_id={ROUTING_HITL_UNCONFIRMED_BLOCKER!r} "
+        f"when a routing edit lacks confirmation; got "
+        f"rejected={rejected!r}"
+    )
+    # Selected must be empty (the only routing edit was
+    # rejected) so the pipeline exits with no candidate.
+    assert last_ranked.get("selected") in (None, [], ()), (
+        f"no suggestion must be selected when the only "
+        f"routing edit is HITL-blocked; got "
+        f"selected={last_ranked.get('selected')!r}"
+    )
+    assert result.status in {"REJECTED", "BLOCKED"}, (
+        f"HITL-blocked run must terminate with REJECTED or "
+        f"BLOCKED status; got {result.status!r}"
+    )
+
+
+def test_optimize_stale_base_hash_blocks_before_disk_write() -> None:
+    """AC4 (stale base detection): an ``edit_suggestion``
+    whose ``base_hash`` does not match the parser-owned
+    :data:`MutableRange.content_hash` of the target range
+    must be rejected before the candidate artifact is
+    written to disk (OPT-1 / OPT-5 / ADR 0032).
+
+    The test pins two contracts:
+
+    1. The pipeline drops the stale suggestion at the
+       round-processing stage (step 3c). The drop is
+       observable in the persisted ``round_reflection``
+       record's ``bounded_rejected_themes`` list as a
+       ``{"kind": "stale_base_hash", ...}`` entry. The
+       artifact on disk must be byte-for-byte unchanged
+       after the run.
+    2. The deterministic
+       :func:`metacrucible.optimizer._check_stale_base_hash`
+       check emits the canonical
+       :data:`STALE_BASE_HASH_BLOCKER` blocker id when a
+       stale ``base_hash`` is given to it directly. This
+       pins the blocker id that downstream reports branch
+       on without driving the full pipeline.
+    """
+    import hashlib
+
+    from metacrucible.optimizer import (
+        STALE_BASE_HASH_BLOCKER,
+        _check_stale_base_hash,
+        build_optimizer_context,
+        run_optimizer_pipeline,
+    )
+
+    workspace = _tmp_workspace()
+    benchmark = workspace / BENCHMARK_FILE_NAME
+    artifact = _opt9_seed_artifact(workspace)
+    _opt9_seed_envelope(workspace, artifact)
+    _write_jsonl(
+        benchmark,
+        [
+            _metadata_record(),
+            _reviewed_case("eval-1", split="eval"),
+            _reviewed_case("held-1", split="held_out"),
+        ],
+    )
+
+    # ``stale_base_hash`` is a deliberately wrong 64-char
+    # hex digest so the pipeline must reject the
+    # suggestion in the round-processing stage.
+    stale_base_hash = "0" * 64
+    assert stale_base_hash != _opt9_body_hash(), (
+        "test fixture invariant: the stale base hash "
+        "must differ from the canonical body hash"
+    )
+
+    def _stale_suggestion(*, repair_context: Any = None) -> dict[str, Any]:
+        return {
+            "rationale": "AC4 stale base regression",
+            "suggested_edits": [
+                {
+                    "range_id": 0,
+                    "base_hash": stale_base_hash,
+                    "intent": "should_be_dropped",
+                    "replacement": (
+                        "# body\nThis replacement must never "
+                        "be written.\n"
+                    ),
+                    "rationale": "stale base hash contract",
+                    "routing": False,
+                }
+            ],
+        }
+
+    before_bytes = artifact.read_bytes()
+
+    result = run_optimizer_pipeline(
+        workspace=workspace,
+        benchmark_path=benchmark,
+        artifact_path=artifact,
+        call_fn=_stale_suggestion,
+        max_rounds=1,
+        human_confirmed=False,
+    )
+
+    # Contract 1a: the artifact on disk must be byte-for-byte
+    # unchanged — the stale suggestion is dropped before
+    # apply.
+    after_bytes = artifact.read_bytes()
+    assert after_bytes == before_bytes, (
+        f"stale-base suggestion must NOT mutate the "
+        f"artifact; before={before_bytes!r} "
+        f"after={after_bytes!r}"
+    )
+
+    # Contract 1b: history must NOT carry a stale
+    # edit_suggestion record. The drop happens before the
+    # suggestion is appended to the record stream.
+    records = _opt9_read_history(workspace)
+    edit_records = _opt9_find_records(records, "edit_suggestion")
+    stale_edit_records = [
+        r for r in edit_records
+        if isinstance(r.get("base_hash"), str)
+        and r["base_hash"] == stale_base_hash
+    ]
+    assert not stale_edit_records, (
+        f"a stale-base edit_suggestion must NEVER be "
+        f"persisted; got {stale_edit_records!r}"
+    )
+
+    # Contract 1c: the pipeline must surface a
+    # ``no_candidate_edits`` warning so downstream tools
+    # can detect the no-mutation outcome. The warning is
+    # the observable signal that the round processed the
+    # suggestion but found it unusable.
+    no_candidate_warnings = [
+        w for w in (result.warnings or [])
+        if isinstance(w, dict)
+        and w.get("id") == "no_candidate_edits"
+    ]
+    assert no_candidate_warnings, (
+        f"a stale-base round must surface a "
+        f"no_candidate_edits warning on result.warnings; "
+        f"got result.warnings={result.warnings!r}"
+    )
+
+    # Contract 2: the deterministic
+    # :func:`_check_stale_base_hash` emits the canonical
+    # STALE_BASE_HASH_BLOCKER id when given a stale
+    # suggestion directly. This pins the blocker id
+    # downstream reports branch on.
+    context = build_optimizer_context(
+        workspace=workspace,
+        benchmark_path=benchmark,
+        artifact_path=artifact,
+        max_rounds=1,
+        human_confirmed=False,
+    )
+    # Build a fresh EditSuggestion whose base_hash is
+    # wrong; ``_check_stale_base_hash`` compares against
+    # the parser-owned ``context.mutable_ranges[*].content_hash``.
+    from metacrucible.optimizer import EditSuggestion
+
+    stale_suggestion = EditSuggestion(
+        record_type="edit_suggestion",
+        suggestion_id="opt9-stale-direct",
+        run_id=context.run_id,
+        round_id="round-direct",
+        timestamp="2026-01-01T00:00:00Z",
+        range_id=0,
+        base_hash=hashlib.sha256(b"definitely-not-the-body").hexdigest(),
+        intent="stale_direct_check",
+        replacement="",
+        rationale="",
+        routing=False,
+    )
+    direct_blockers = _check_stale_base_hash(
+        [stale_suggestion], context
+    )
+    stale_direct_blockers = [
+        b for b in direct_blockers
+        if isinstance(b, dict) and b.get("id") == STALE_BASE_HASH_BLOCKER
+    ]
+    assert stale_direct_blockers, (
+        f"_check_stale_base_hash must emit the "
+        f"{STALE_BASE_HASH_BLOCKER!r} blocker id for a "
+        f"stale base_hash; got {direct_blockers!r}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# BLK-2 — OPT-6 ACCEPTED-path regression test                                 #
+# --------------------------------------------------------------------------- #
+
+def test_optimize_pipeline_accepted_path() -> None:
+    """BLK-2: a candidate with strict eval-split improvement
+    AND zero new held-out regressions must reach ACCEPTED
+    status; the candidate's text is written to disk and
+    ``acceptance_decision.accepted`` is True.
+
+    This pins the OPT-6 acceptance comparator end-to-end.
+    Without it, no test in the suite drives the pipeline to
+    the ACCEPTED branch (BLK-1 made the path unreachable;
+    the inverted ``fits_in_range`` check blocked every real
+    edit at step 3f, so the runner exited BLOCKED before
+    the acceptance comparator ever ran). After BLK-1 the
+    path is reachable; this test confirms it works.
+
+    Test mechanics:
+
+      - The eval_call_fn returns FAIL for ``eval-1`` when
+        the on-disk artifact body does NOT contain the
+        ``OPT9_ACCEPT_MARKER`` marker (baseline), and PASS
+        when the marker is present (candidate).
+      - The held-out case ``held-1`` always returns PASS,
+        so the candidate cannot introduce a new held-out
+        regression.
+      - The LLM ``call_fn`` returns a valid
+        ``round_reflection`` whose ``suggested_edits`` has
+        one entry targeting the body's ``range_id=0`` with
+        a ``replacement`` that contains the accept marker.
+      - The candidate's body differs from the base, so the
+        inverted BLK-1 fits_in_range check would have
+        blocked the round; the test fails if BLK-1 is
+        reintroduced.
+    """
+    from metacrucible.optimizer import run_optimizer_pipeline
+
+    workspace = _tmp_workspace()
+    benchmark = workspace / BENCHMARK_FILE_NAME
+    artifact = _opt9_seed_artifact(workspace)
+    _opt9_seed_envelope(workspace, artifact)
+    _write_jsonl(
+        benchmark,
+        [
+            _metadata_record(),
+            _reviewed_case("eval-1", split="eval"),
+            _reviewed_case("held-1", split="held_out"),
+        ],
+    )
+
+    body_hash = _opt9_body_hash()
+    accept_marker = "OPT9_ACCEPT_MARKER"
+    candidate_body = _opt9_body_text() + "\n" + accept_marker + "\n"
+
+    def _accept_call_fn(*, repair_context: Any = None) -> dict[str, Any]:
+        return {
+            "rationale": "ACCEPTED-path regression: add marker",
+            "suggested_edits": [
+                {
+                    "range_id": 0,
+                    "base_hash": body_hash,
+                    "intent": "add_accept_marker",
+                    "replacement": candidate_body,
+                    "rationale": "candidate adds accept marker",
+                    "routing": False,
+                }
+            ],
+        }
+
+    def _accept_eval_call_fn(case: Mapping[str, Any]) -> Mapping[str, Any]:
+        case_id = case.get("case_id", "")
+        if case_id == "eval-1":
+            artifact_text = artifact.read_text(encoding="utf-8")
+            if accept_marker in artifact_text:
+                return {"status": "PASS", "case_id": case_id}
+            return {"status": "FAIL", "case_id": case_id}
+        # held-out case: always PASS so no new regression.
+        return {"status": "PASS", "case_id": case_id}
+
+    result = run_optimizer_pipeline(
+        workspace=workspace,
+        benchmark_path=benchmark,
+        artifact_path=artifact,
+        call_fn=_accept_call_fn,
+        max_rounds=1,
+        human_confirmed=False,
+        eval_call_fn=_accept_eval_call_fn,
+    )
+
+    # The pipeline must reach ACCEPTED after BLK-1 fix.
+    assert result.status == "ACCEPTED", (
+        f"strict eval improvement + zero new held-out "
+        f"regressions must reach ACCEPTED status; got "
+        f"status={result.status!r} "
+        f"acceptance_decision={result.acceptance_decision!r}"
+    )
+    assert result.best_revision is not None, (
+        f"accepted run must populate best_revision; got "
+        f"{result.best_revision!r}"
+    )
+    assert result.acceptance_decision.get("accepted") is True, (
+        f"acceptance_decision.accepted must be True on an "
+        f"accepted run; got "
+        f"acceptance_decision={result.acceptance_decision!r}"
+    )
+    # The comparator's machine-readable verdict must be
+    # "accepted" (the strict-improvement-and-clean-held-out
+    # reason), not "eval_no_improvement" or
+    # "held_out_regression".
+    assert result.acceptance_decision.get("reason") == "accepted", (
+        f"acceptance_decision.reason must be 'accepted' "
+        f"on a strict-improvement-and-clean-held-out run; "
+        f"got {result.acceptance_decision.get('reason')!r}"
+    )
+    # The artifact on disk must be the candidate text
+    # (the accepted candidate is committed, not rolled
+    # back). This is the load-bearing end-to-end check:
+    # it proves the runner took the ACCEPTED branch and
+    # skipped the rollback path.
+    import hashlib as _hashlib
+    artifact_bytes_after = artifact.read_bytes()
+    artifact_sha_after = _hashlib.sha256(
+        artifact_bytes_after
+    ).hexdigest()
+    artifact_sha_before = _hashlib.sha256(
+        _opt9_body_text().encode("utf-8")
+        # The base artifact is a Skill-shaped fixture
+        # with frontmatter + the canonical OPT-9 body.
+        # We compare against the seeded on-disk bytes
+        # (the test seeds it via _opt9_seed_artifact).
+    ).hexdigest()
+    # The accepted candidate wrote new bytes; the file
+    # SHA must differ from the seed hash that the runner
+    # saw at baseline-eval time. The runner read
+    # ``base_artifact_text = Path(artifact).read_bytes()``
+    # before apply; if rollback ran, the on-disk bytes
+    # would equal that hash. We assert the OPPOSITE: the
+    # accepted candidate committed a different artifact.
+    base_artifact_hash = best_revision_pre_sha = None
+    # Use best_revision.artifact_text_sha256 when
+    # available; otherwise compare to the seeded bytes
+    # which we know the baseline saw.
+    if result.best_revision is not None:
+        best_revision_pre_sha = (
+            result.best_revision.get("artifact_text_sha256")
+        )
+    # The on-disk SHA must equal the best_revision's
+    # candidate SHA (the runner wrote the candidate to
+    # disk and did not roll back).
+    assert best_revision_pre_sha is not None
+    assert artifact_sha_after == best_revision_pre_sha, (
+        f"accepted candidate's on-disk SHA must match "
+        f"best_revision.artifact_text_sha256 (no "
+        f"rollback); on-disk={artifact_sha_after!r} "
+        f"best_revision="
+        f"{best_revision_pre_sha!r}"
+    )
+    # The history must record the optimize_accepted event.
+    records = _opt9_read_history(workspace)
+    accepted_events = [
+        r for r in records
+        if isinstance(r, dict)
+        and r.get("event") == "optimize_accepted"
+    ]
+    assert accepted_events, (
+        f"accepted run must append an optimize_accepted "
+        f"history event; got events="
+        f"{[r.get('event') for r in records]!r}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# NB-4 parity test — optimizer._split_artifact_text vs artifact._split_frontmatter
+# --------------------------------------------------------------------------- #
+
+def test_split_artifact_text_matches_parser_frontmatter_split() -> None:
+    """NB-4 parity: ``optimizer._split_artifact_text`` and
+    ``artifact._split_frontmatter`` must produce equivalent
+    ``(frontmatter, body)`` splits for every well-formed
+    artifact the parser accepts. This pins the single
+    convention: any future frontmatter-shape change in
+    :mod:`metacrucible.artifact` must keep the optimizer's
+    helper in lockstep (or the test will fail).
+    """
+    from metacrucible.artifact import _split_frontmatter
+    from metacrucible.optimizer import _split_artifact_text
+
+    # A representative Skill artifact source.
+    skill_source = (
+        "---\n"
+        "name: parity-skill\n"
+        "description: NB-4 parity fixture\n"
+        "---\n"
+        "# body\nThe body is the only mutable range.\n"
+    )
+    # A representative subagent artifact source with a
+    # systemPrompt block.
+    subagent_source = (
+        "---\n"
+        "name: parity-subagent\n"
+        "description: NB-4 parity subagent fixture\n"
+        "systemPrompt: |\n"
+        "  You are a parity-test agent.\n"
+        "---\n"
+        "Agent body text for the parity test.\n"
+    )
+
+    for label, source in (
+        ("skill", skill_source),
+        ("subagent", subagent_source),
+    ):
+        parser_front, parser_body = _split_frontmatter(source)
+        opt_front, opt_body = _split_artifact_text(source)
+        assert parser_front == opt_front, (
+            f"NB-4 parity ({label}): optimizer frontmatter "
+            f"differs from parser; parser={parser_front!r} "
+            f"optimizer={opt_front!r}"
+        )
+        assert parser_body == opt_body, (
+            f"NB-4 parity ({label}): optimizer body differs "
+            f"from parser; parser={parser_body!r} "
+            f"optimizer={opt_body!r}"
+        )

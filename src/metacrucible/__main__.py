@@ -45,6 +45,18 @@ import datetime as _dt
 import json
 import sys
 import uuid
+from .optimizer import (
+    ROUND_BUDGET_DEFAULT,
+    ROUTING_CAP_EXCEEDED_BLOCKER,
+    ROUTING_HITL_UNCONFIRMED_BLOCKER,
+    SCHEMA_VALIDATION_BLOCKED,
+    STALE_BASE_HASH_BLOCKER,
+    MUTABLE_RANGE_CONFLICT_BLOCKER,
+    OptimizerContext,
+    OptimizerPipelineResult,
+    build_optimizer_context,
+    run_optimizer_pipeline,
+)
 import subprocess
 import hashlib
 from pathlib import Path
@@ -325,6 +337,31 @@ EVALUATE_BENCHMARK_MISSING_BLOCKER = "evaluate-benchmark-missing"
 EVALUATE_NO_ELIGIBLE_CASES_BLOCKER = "evaluate-no-eligible-cases"
 
 #: Run-type value written into the BLOCKED evidence bundle by
+# --------------------------------------------------------------------------- #
+# Issue #33 (PRD F3 ``optimize``) constants                                  #
+# --------------------------------------------------------------------------- #
+#
+# The MVP optimizer is a reimplementation of the SkillOpt-shaped
+# loop (ADR 0022 / ADR 0032). The CLI is a thin wrapper around
+# :func:`metacrucible.optimizer.run_optimizer_pipeline`; the new
+# blocker ids emitted on the pipeline paths land here as
+# machine-stable re-exports so the rest of the CLI surface
+# (blockers list, evidence receipt, --json output) can branch
+# on the same string.
+
+#: Run-type value written into the evidence bundle by
+#: :func:`cmd_optimize`. Matches the ADR 0035 ``optimize``
+#: slot in
+#: :data:`metacrucible.blocked_bundles.REQUIRES_BLOCKED_BUNDLE_CATEGORIES`
+#: so the matrix routes the BLOCKED bundle write through
+#: :func:`metacrucible.blocked_bundles.write_blocked_bundle`.
+OPTIMIZE_BLOCKED_BUNDLE_RUN_TYPE = "optimize"
+
+#: Run-id prefix used when emitting the ``optimize`` BLOCKED
+#: evidence bundle. Mirrors the ``evaluate`` / ``baseline-create``
+#: prefixes; downstream tooling can branch on the prefix to
+#: distinguish optimize bundles from other BLOCKED categories.
+OPTIMIZE_BLOCKED_BUNDLE_RUN_ID_PREFIX = "optimize"
 #: :func:`_write_evaluate_blocked_bundle`. Matches the ADR 0035
 #: ``evaluate`` slot in
 #: :data:`metacrucible.blocked_bundles.REQUIRES_BLOCKED_BUNDLE_CATEGORIES`
@@ -515,12 +552,31 @@ def _build_parser() -> argparse.ArgumentParser:
         help="path to the artifact workspace",
     )
     optimize_parser.add_argument(
+        "--max-rounds",
+        type=int,
+        default=ROUND_BUDGET_DEFAULT,
+        help=(
+            "maximum number of optimization rounds the pipeline "
+            f"may attempt (default: {ROUND_BUDGET_DEFAULT}); "
+            "bounded and observable; no silent infinite loop "
+            "(OPT-8 / PRD F3)"
+        ),
+    )
+    optimize_parser.add_argument(
+        "--confirm-routing",
+        action="store_true",
+        help=(
+            "explicit human confirmation that any selected "
+            "routing edit may enter a candidate revision "
+            "(ADR 0027 / ADR 0032); without this flag the "
+            "routing HITL gate blocks the round"
+        ),
+    )
+    optimize_parser.add_argument(
         "--json",
         action="store_true",
         help="emit a parseable JSON object on stdout",
     )
-    # ``baseline`` subcommand (Issue #31). The nested ``create``
-    # action is the MVP contract; future actions (e.g. ``list`` /
     # ``verify``) extend the same nested parser without breaking
     # the ``baseline`` outer shape. ``dest="baseline_action"`` on
     # the inner subparser so the dispatcher can branch on
@@ -2197,142 +2253,326 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _write_optimize_blocked_bundle(
+    *, blockers: list[dict[str, Any]]
+) -> None:
+    """Emit the ADR 0035 ``optimize`` BLOCKED evidence bundle.
+
+    Best-effort: a write failure is logged to stderr and the
+    in-memory payload still carries the BLOCKED verdict, so
+    the caller (:func:`cmd_optimize`) still returns the
+    :data:`EXIT_BLOCKED` exit code. The BLOCKED bundle is
+    the *evidence* of the BLOCKED verdict, not the source
+    of truth; the in-memory payload wins.
+
+    Mirrors :func:`_write_evaluate_blocked_bundle` /
+    :func:`_write_baseline_blocked_bundle` so the four
+    BLOCKED-emitting commands share a single, predictable
+    write contract.
+    """
+    try:
+        global_store = UserGlobalStorage()
+        run_id = (
+            f"{OPTIMIZE_BLOCKED_BUNDLE_RUN_ID_PREFIX}-"
+            f"{_now_iso().replace(':', '').replace('-', '')}"
+        )
+        write_blocked_bundle(
+            global_store,
+            run_id=run_id,
+            run_type=OPTIMIZE_BLOCKED_BUNDLE_RUN_TYPE,
+            blockers=blockers,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"metacrucible: failed to write optimize BLOCKED "
+            f"bundle: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+
+
 def cmd_optimize(args: argparse.Namespace) -> int:
     """Run the ``optimize`` subcommand; return the process exit code.
 
-    MVP sentinel gate (PRD F3 / Issue #30):
+    Issue #33 / PRD F3: replace the MVP sentinel gate with the
+    full SkillOpt-shaped optimizer pipeline (ADR 0032 /
+    ADR 0022). The command is a thin wrapper around
+    :func:`metacrucible.optimizer.run_optimizer_pipeline`
+    that:
 
-      - Resolves the workspace path and reads the benchmark
-        through :func:`metacrucible.benchmark.load_benchmark`
-        so the loader partitions the cases into the four ADR
-        0029 buckets and surfaces the canonical blockers.
-      - A missing benchmark file is reported via the loader
-        (missing-reviewed-eval-case + missing-reviewed-held-out-case);
-        the optimize command relays those blockers verbatim
-        rather than inventing its own.
-      - If any case carries the
-        :data:`BOOTSTRAP_PENDING_REVIEW_FIELD` sentinel
-        (Issue #30 AC3), the optimize command refuses to
-        start with a dedicated
-        ``bootstrap-pending-review`` blocker so the operator
-        can see exactly which cases are blocking the gate.
-        The loader's own ``pending-generated-case`` blocker
-        is preserved alongside so the operator sees the full
-        picture.
-      - A benchmark that is otherwise optimize-runnable (no
-        loader blockers, no bootstrap sentinel) still returns
-        :data:`EXIT_BLOCKED` with the
-        :data:`OPTIMIZE_NOT_IMPLEMENTED_BLOCKER` blocker:
-        full optimization is W3 per the PRD, and the MVP
-        contract is "we will refuse with a stable reason
-        code" rather than "we silently do nothing".
+      - Resolves the workspace, benchmark path, and the
+        envelope-declared ``artifact_path``. A missing
+        workspace, benchmark, or artifact is BLOCKED with
+        the canonical loader blocker ids; the optimize
+        command never invents a verdict the loader did
+        not already explain.
+      - Propagates the loader's blockers and the
+        bootstrap-sentinel blocker so a generated case or
+        ``BOOTSTRAP_PENDING_REVIEW`` flag still refuses
+        the start (the existing test contract).
+      - Threads ``--max-rounds`` and ``--confirm-routing``
+        through to the pipeline.
+      - Emits the human / ``--json`` payload per the
+        :func:`cmd_optimize` output contract (status,
+        rounds, decision, blockers, warnings, record
+        counts, evidence refs, artifact path, best
+        revision). ``EXIT_OK`` for accepted / no-blocking
+        outcomes; ``EXIT_BLOCKED`` otherwise.
+      - On a precondition failure (loader blocker /
+        bootstrap sentinel / missing artifact), writes
+        the ADR 0035 ``optimize`` BLOCKED evidence bundle
+        so the receipt lineage carries the "we could not
+        proceed" record.
 
-    The command never mutates the benchmark file; the
-    sentinel check is a read-only pass over the loader's
-    partitioned cases.
+    The command never mutates the benchmark file. The
+    artifact is mutated *only* when the pipeline accepts a
+    candidate; the run-level rollback restores the base
+    bytes on every non-accepted outcome (no automatic git
+    commits, per PRD F3 / Issue #33).
     """
     from .benchmark import load_benchmark
+    from .optimizer import _resolve_artifact_path
 
     workspace = Path(args.workspace).resolve()
     benchmark = workspace / BENCHMARK_FILE_NAME
-    benchmark_state: dict[str, Any] = {
-        "present": benchmark.is_file(),
-        "path": str(benchmark),
-    }
+    as_json = bool(getattr(args, "json", False))
+    max_rounds = int(
+        getattr(args, "max_rounds", ROUND_BUDGET_DEFAULT)
+    )
+    if max_rounds < 1:
+        max_rounds = 1
+    human_confirmed = bool(getattr(args, "confirm_routing", False))
 
-    blockers: list[dict[str, Any]] = []
-    pending_review_case_ids: list[str] = []
-    is_optimize_runnable = False
+    # Precondition 1: workspace must be an existing directory.
+    if not workspace.is_dir():
+        blockers: list[dict[str, Any]] = [
+            {
+                "id": "optimize-workspace-missing",
+                "message": (
+                    f"workspace {workspace} does not exist or "
+                    f"is not a directory; run ``metacrucible init "
+                    f"{workspace}`` first"
+                ),
+            }
+        ]
+        _write_optimize_blocked_bundle(blockers=blockers)
+        _emit(
+            {
+                "status": "BLOCKED",
+                "workspace": str(workspace),
+                "benchmark": str(benchmark),
+                "rounds": 0,
+                "blockers": blockers,
+            },
+            as_json=as_json,
+        )
+        return EXIT_BLOCKED
 
-    if benchmark_state["present"]:
-        result = load_benchmark(benchmark)
-        is_optimize_runnable = result.is_optimize_runnable
-        # Propagate every loader blocker; the loader already
-        # partitions by status / split and the four-bucket
-        # surface is the canonical contract.
-        for blocker in result.blockers:
-            if isinstance(blocker, dict) and isinstance(
-                blocker.get("id"), str
-            ):
-                blockers.append(dict(blocker))
-        # Surface the bootstrap sentinel explicitly so the
-        # operator sees the *specific* mechanism blocking
-        # optimization, even when the loader's
-        # pending-generated-case blocker already covers the
-        # same condition.
-        for case in result.cases:
-            if not isinstance(case, dict):
-                continue
-            if case.get(BOOTSTRAP_PENDING_REVIEW_FIELD) is True:
-                cid = case.get("case_id")
-                if isinstance(cid, str) and cid:
-                    pending_review_case_ids.append(cid)
-    else:
-        # No benchmark at the workspace root. The loader
-        # would surface missing-reviewed-eval-case and
-        # missing-reviewed-held-out-case; we mirror that
-        # here so the optimize path is observable without
-        # the loader (defensive — ``load_benchmark`` would
-        # also produce these on a missing file).
-        blockers.append(
+    # Precondition 2: benchmark file must be present.
+    if not benchmark.is_file():
+        blockers = [
             {
                 "id": "missing-reviewed-eval-case",
                 "message": (
                     "no eligible reviewed eval cases (ADR 0025)"
                 ),
-            }
-        )
-        blockers.append(
+            },
             {
                 "id": "missing-reviewed-held-out-case",
                 "message": (
                     "no eligible reviewed held-out cases (ADR 0025)"
                 ),
-            }
+            },
+        ]
+        _write_optimize_blocked_bundle(blockers=blockers)
+        _emit(
+            {
+                "status": "BLOCKED",
+                "workspace": str(workspace),
+                "benchmark": str(benchmark),
+                "rounds": 0,
+                "blockers": blockers,
+            },
+            as_json=as_json,
         )
+        return EXIT_BLOCKED
 
+    # Precondition 3: loader-level blockers / bootstrap
+    # sentinel. The loader partitions the cases; we
+    # propagate its blockers verbatim and add the
+    # bootstrap-pending-review blocker when the literal
+    # sentinel is present (per the existing Issue #30 AC3
+    # contract).
+    result = load_benchmark(benchmark)
+    blockers = [
+        dict(b) for b in result.blockers
+        if isinstance(b, dict) and isinstance(b.get("id"), str)
+    ]
+    pending_review_case_ids: list[str] = []
+    for case in result.cases:
+        if not isinstance(case, dict):
+            continue
+        if case.get(BOOTSTRAP_PENDING_REVIEW_FIELD) is True:
+            cid = case.get("case_id")
+            if isinstance(cid, str) and cid:
+                pending_review_case_ids.append(cid)
     if pending_review_case_ids:
         blockers.append(
             {
                 "id": "bootstrap-pending-review",
                 "message": (
-                    f"{len(pending_review_case_ids)} bootstrap-generated "
-                    f"case(s) still carry the pending-review sentinel; "
-                    f"promote them (or remove the sentinel) before "
-                    f"optimizing. case_ids={pending_review_case_ids!r}"
+                    f"{len(pending_review_case_ids)} bootstrap-"
+                    "generated case(s) still carry the "
+                    "pending-review sentinel; promote them (or "
+                    "remove the sentinel) before optimizing. "
+                    f"case_ids={pending_review_case_ids!r}"
                 ),
             }
         )
 
-    if is_optimize_runnable and not pending_review_case_ids:
-        # Loader said the benchmark is runnable, and no
-        # bootstrap sentinel blocks the gate. Full
-        # optimization is W3 per the PRD; surface a
-        # dedicated blocker so the operator sees the
-        # "not yet implemented" reason rather than a
-        # silent success.
-        blockers.append(
+    if not result.is_optimize_runnable or pending_review_case_ids:
+        _write_optimize_blocked_bundle(blockers=blockers)
+        _emit(
             {
-                "id": OPTIMIZE_NOT_IMPLEMENTED_BLOCKER,
+                "status": "BLOCKED",
+                "workspace": str(workspace),
+                "benchmark": str(benchmark),
+                "is_optimize_runnable": bool(
+                    result.is_optimize_runnable
+                    and not pending_review_case_ids
+                ),
+                "pending_review_case_ids": pending_review_case_ids,
+                "rounds": 0,
+                "blockers": blockers,
+            },
+            as_json=as_json,
+        )
+        return EXIT_BLOCKED
+
+    # Precondition 4: envelope-declared artifact_path. The
+    # optimizer cannot run without an artifact to
+    # optimize; the contract is the same as baseline
+    # create (OD1).
+    artifact_path_value = _resolve_artifact_path(workspace)
+    if artifact_path_value is None:
+        blockers = [
+            {
+                "id": "optimize-artifact-unresolved",
                 "message": (
-                    "the optimize command's MVP is a sentinel gate; "
-                    "full optimization lands in W3 (PRD F3)"
+                    f"envelope at {workspace / '.metacrucible' / 'envelope.json'} "
+                    "does not declare an ``artifact_path`` (or "
+                    "``canonical_source``) field; the optimizer "
+                    "refuses to scan / glob the workspace"
                 ),
             }
+        ]
+        _write_optimize_blocked_bundle(blockers=blockers)
+        _emit(
+            {
+                "status": "BLOCKED",
+                "workspace": str(workspace),
+                "benchmark": str(benchmark),
+                "rounds": 0,
+                "blockers": blockers,
+            },
+            as_json=as_json,
         )
+        return EXIT_BLOCKED
 
-    payload = {
+    artifact_path = Path(artifact_path_value).resolve()
+    if not artifact_path.is_file():
+        blockers = [
+            {
+                "id": "optimize-artifact-missing",
+                "message": (
+                    f"artifact {artifact_path} does not exist; "
+                    "the envelope declared a path that is not "
+                    "on disk"
+                ),
+            }
+        ]
+        _write_optimize_blocked_bundle(blockers=blockers)
+        _emit(
+            {
+                "status": "BLOCKED",
+                "workspace": str(workspace),
+                "benchmark": str(benchmark),
+                "artifact_path": str(artifact_path),
+                "rounds": 0,
+                "blockers": blockers,
+            },
+            as_json=as_json,
+        )
+        return EXIT_BLOCKED
+
+    # Run the pipeline. The CLI passes ``call_fn=None``;
+    # tests monkey-patch ``run_optimizer_pipeline`` to
+    # inject a deterministic fake. The pipeline is
+    # bounded by ``max_rounds``; the CLI never loops
+    # forever.
+    pipeline_result: OptimizerPipelineResult = run_optimizer_pipeline(
+        workspace=workspace,
+        benchmark_path=benchmark,
+        artifact_path=artifact_path,
+        call_fn=None,
+        max_rounds=max_rounds,
+        human_confirmed=human_confirmed,
+    )
+
+    # Compose the OPT-8 / OPT-9 output. The status field
+    # is the machine-stable verdict: ``ACCEPTED`` /
+    # ``REJECTED`` / ``BLOCKED``. The CLI exit code is
+    # :data:`EXIT_OK` for accepted and no-blocking
+    # rejected, and :data:`EXIT_BLOCKED` for everything
+    # else. The contract mirrors the central matrix in
+    # :mod:`metacrucible.exit_codes`.
+    record_counts = dict(pipeline_result.record_counts)
+    best_revision = pipeline_result.best_revision or {}
+    best_revision_summary: dict[str, Any] | None = (
+        {
+            "run_id": str(best_revision.get("run_id", "")),
+            "round_id": str(best_revision.get("round_id", "")),
+            "artifact_path": str(
+                best_revision.get("artifact_path", "")
+            ),
+            "artifact_text_sha256": str(
+                best_revision.get("artifact_text_sha256", "")
+            ),
+        }
+        if pipeline_result.best_revision
+        else None
+    )
+    payload: dict[str, Any] = {
+        "status": pipeline_result.status,
         "workspace": str(workspace),
         "benchmark": str(benchmark),
-        "benchmark_present": benchmark_state["present"],
-        "is_optimize_runnable": (
-            is_optimize_runnable and not pending_review_case_ids
+        "artifact_path": str(artifact_path),
+        "run_id": pipeline_result.run_id,
+        "rounds": pipeline_result.rounds,
+        "max_rounds": max_rounds,
+        "record_counts": record_counts,
+        "evidence_refs": dict(pipeline_result.evidence_refs),
+        "blockers": list(pipeline_result.blockers),
+        "warnings": list(pipeline_result.warnings),
+        "acceptance_decision": dict(
+            pipeline_result.acceptance_decision
         ),
-        "pending_review_case_ids": pending_review_case_ids,
-        "blockers": blockers,
+        "best_revision": best_revision_summary,
+        "selected_candidate_ids": list(
+            pipeline_result.selected_candidate_ids
+        ),
     }
-    _emit(payload, as_json=args.json)
+    _emit(payload, as_json=as_json)
+
+    if pipeline_result.status in ("ACCEPTED", "REJECTED"):
+        # REJECTED with no blockers is the
+        # "no-improvement-yet" path; the in-memory
+        # payload still carries the verdict. EXIT_OK so
+        # the caller can branch on the JSON ``status``
+        # field, not the exit code.
+        return EXIT_OK
     return EXIT_BLOCKED
+
+
 
 
 def cmd_init(args: argparse.Namespace) -> int:

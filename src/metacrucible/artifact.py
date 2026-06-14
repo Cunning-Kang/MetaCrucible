@@ -14,6 +14,11 @@ of Issue #4 and the binding ADRs:
   - ADR 0019 (treat subagent systemPrompt as body) — ``systemPrompt``
     is surfaced as a mutable body range even though it lives inside
     the frontmatter, and the parser does not classify it as routing.
+  - Issue #33 / OPT-1 — :class:`MutableRange` carries
+    ``range_id`` (positional) and ``content_hash`` (SHA-256 hex of
+    ``.text``) so the optimizer can reference a specific range and
+    detect a stale base without re-parsing the artifact. The parser
+    is the single producer of these fields; no second convention.
 
 YAML subset
 -----------
@@ -32,12 +37,16 @@ canonical sources from ADR 0005 only exercise the shapes above.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
 __all__ = [
     "MutableRange",
+    "SKILL_ROUTING_FIELDS",
+    "SUBAGENT_EXECUTION_PARAMS",
+    "SUBAGENT_ROUTING_FIELDS",
     "SkillArtifact",
     "SubagentArtifact",
     "parse_skill",
@@ -52,9 +61,24 @@ class MutableRange:
     Each mutable range carries its own text so optimizers can read the
     body without re-parsing the artifact. ``.text`` is the canonical
     attribute; the parser is the single producer of these objects.
+
+    The ``range_id`` and ``content_hash`` fields (Issue #33 / OPT-1)
+    pin the range's stable identity so the optimizer can detect a
+    stale base (the base hash shifted) and reference a specific range
+    in ``edit_suggestion`` records without re-parsing the artifact.
+    The parser is the single producer: it assigns ``range_id`` as the
+    positional index of the range in the artifact's
+    ``mutable_ranges`` tuple (0-based) and ``content_hash`` as the
+    lowercase SHA-256 hex digest of ``.text`` UTF-8 bytes. Callers
+    MUST NOT construct a ``MutableRange`` with arbitrary
+    ``range_id`` / ``content_hash`` values; the two fields are
+    parser-owned so a stale-base check can compare them
+    field-for-field without trusting caller-supplied state.
     """
 
     text: str
+    range_id: int = 0
+    content_hash: str = ""
 
 
 @dataclass(frozen=True)
@@ -243,11 +267,43 @@ def _parse_frontmatter(text: str) -> dict[str, Any]:
 
 # --- Public parse API ----------------------------------------------------- #
 
+def _content_hash_for(*, text: str) -> str:
+    """Return the lowercase SHA-256 hex digest of ``text`` UTF-8 bytes.
+
+    Stable-content hash used by :class:`MutableRange` to pin a
+    range's identity for stale-base detection (Issue #33 / OPT-1).
+    The function is a tiny, side-effect-free wrapper around
+    :func:`hashlib.sha256` so callers do not have to import
+    ``hashlib`` and so the parser is the single producer of
+    ``content_hash`` values (no second convention).
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _make_range(*, text: str, range_id: int) -> MutableRange:
+    """Build a :class:`MutableRange` with parser-owned identity fields.
+
+    Centralizes the ``range_id`` / ``content_hash`` assignment so
+    :func:`parse_skill` and :func:`parse_subagent` share a single
+    producer. Tests and downstream code MUST go through this helper
+    (or the parsers themselves) rather than constructing
+    ``MutableRange`` instances directly.
+    """
+    return MutableRange(
+        text=text,
+        range_id=range_id,
+        content_hash=_content_hash_for(text=text),
+    )
+
+
 def parse_skill(source: str) -> SkillArtifact:
     """Parse a Skill capability artifact from its canonical source.
 
     The Markdown body (everything after the closing ``---``) is
-    exposed as the single mutable body range. Skill frontmatter
+    exposed as the single mutable body range, with ``range_id=0``
+    and ``content_hash`` set to the SHA-256 hex of the body
+    (Issue #33 / OPT-1: the parser is the single producer of
+    ``range_id`` and ``content_hash``). Skill frontmatter
     routing-surface fields (``name``, ``description``) are reported
     on ``routing_surface``; ``execution_params`` is always empty for
     Skills in the MVP.
@@ -257,7 +313,7 @@ def parse_skill(source: str) -> SkillArtifact:
     routing = frozenset(
         key for key in frontmatter if key in SKILL_ROUTING_FIELDS
     )
-    body_range = MutableRange(text=body) if body else MutableRange(text="")
+    body_range = _make_range(text=body, range_id=0)
     return SkillArtifact(
         routing_surface=routing,
         execution_params=frozenset(),
@@ -274,7 +330,10 @@ def parse_subagent(source: str) -> SubagentArtifact:
     range per ADR 0019, alongside the Markdown body that follows the
     closing ``---``. Routing surface and execution parameter fields
     are reported disjointly so the optimizer can refuse to touch
-    routing surface mutations.
+    routing surface mutations. ``range_id`` is assigned in
+    declaration order (system prompt first, then Markdown body) so
+    edit suggestions carry a stable, parser-owned range id
+    (Issue #33 / OPT-1).
     """
     front, body = _split_frontmatter(source)
     frontmatter = _parse_frontmatter(front)
@@ -287,9 +346,9 @@ def parse_subagent(source: str) -> SubagentArtifact:
     ranges: list[MutableRange] = []
     system_prompt = frontmatter.get("systemPrompt", "")
     if isinstance(system_prompt, str) and system_prompt:
-        ranges.append(MutableRange(text=system_prompt))
+        ranges.append(_make_range(text=system_prompt, range_id=len(ranges)))
     if body:
-        ranges.append(MutableRange(text=body))
+        ranges.append(_make_range(text=body, range_id=len(ranges)))
     return SubagentArtifact(
         routing_surface=routing,
         execution_params=execution,
