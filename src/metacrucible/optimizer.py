@@ -40,7 +40,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .artifact import (
     SUBAGENT_ROUTING_FIELDS,
@@ -89,10 +89,14 @@ __all__ = [
     "STOP_REASON_NO_CANDIDATE_SELECTED",
     "STOP_REASON_PRECONDITION_BLOCKED",
     "STOP_REASON_ROUND_BLOCKED",
+    "RESUME_CONFIRMATION_REQUIRED_BLOCKER",
+    "RESUME_NON_INTERACTIVE_BLOCKER",
     "apply_patch_revision",
     "build_optimizer_context",
     "compare_eval_held_out",
+    "detect_interrupted_optimizer_runs",
     "run_optimizer_pipeline",
+    "validate_resume_interrupted_runs",
 ]
 
 
@@ -139,6 +143,19 @@ ROUTING_HITL_UNCONFIRMED_BLOCKER: str = "routing-hitl-unconfirmed"
 #: (OPT-5). A stale base hash is the canonical "another writer
 #: changed the range under us" signal.
 STALE_BASE_HASH_BLOCKER: str = "stale-base-hash"
+
+
+#: Stable blocker id emitted when an interactive ``optimize`` run is
+#: asked to resume an interrupted run without explicit confirmation
+#: (Issue #38 / ADR 0017). The gate surfaces the blocker so the CLI
+#: can prompt the user; the pipeline never auto-resumes.
+RESUME_CONFIRMATION_REQUIRED_BLOCKER: str = "resume-confirmation-required"
+
+#: Stable blocker id emitted when a non-interactive ``optimize`` run
+#: is asked to resume an interrupted run without the
+#: ``--confirm-resume`` flag (Issue #38 / ADR 0017). The gate blocks
+#: the run so automation aborts instead of silently resuming.
+RESUME_NON_INTERACTIVE_BLOCKER: str = "resume-non-interactive-blocked"
 
 #: Stable blocker id emitted when a conflict check rejects the
 #: selected edit set: overlapping ranges, contradictory intent,
@@ -704,6 +721,146 @@ def _append_history(
     contract minimal.
     """
     repo.append_history(dict(record))
+
+
+# --------------------------------------------------------------------------- #
+# Issue #38 / ADR 0017 — interrupted-run detection + resume gate (pure)        #
+# --------------------------------------------------------------------------- #
+
+
+def detect_interrupted_optimizer_runs(
+    history_events: Iterable[Mapping[str, object]],
+) -> list[str]:
+    """Return optimize run IDs that started without a matching finish event.
+
+    The detector is pure: it consumes an already-loaded iterable
+    of history records (the same shape
+    :meth:`metacrucible.storage.RepositoryStorage.read_history`
+    returns) and reports the set of run ids whose
+    ``optimize_started`` event has no matching
+    ``optimize_finished`` event in the same stream.
+
+    Contract:
+
+    - Iterates the input exactly once.
+    - Only ``event == "optimize_started"`` / ``"optimize_finished"``
+      with a string ``run_id`` count; malformed records are
+      silently skipped.
+    - Returned run ids preserve first-seen start order.
+    - Duplicate starts for the same unfinished run id collapse
+      to a single entry (the id appears in the output once).
+    - A finish event with a different ``run_id`` does NOT clear
+      a started run (finish is keyed on ``run_id``).
+
+    The function performs no I/O, reads no stdin, and never
+    instantiates storage. It is the unit-testable core the CLI
+    layer (Task 2) wires into the resume gate.
+    """
+    # State per run_id:
+    #   - ``started`` means at least one ``optimize_started`` has
+    #     been seen; ``started_order`` preserves first-seen start
+    #     order for the result list.
+    #   - ``finished`` means the LAST seen event for the run_id
+    #     was an ``optimize_finished``. A later ``optimize_started``
+    #     resets it to ``False`` (the run was restarted).
+    # The dict keys preserve insertion order so we can iterate
+    # in first-seen start order without an extra index.
+    state: dict[str, dict[str, object]] = {}
+    for event in history_events:
+        if not isinstance(event, Mapping):
+            continue
+        event_name = event.get("event")
+        run_id = event.get("run_id")
+        if not isinstance(run_id, str):
+            continue
+        if event_name == "optimize_started":
+            entry = state.get(run_id)
+            if entry is None:
+                state[run_id] = {"started": True, "finished": False}
+            else:
+                # Duplicate starts for the same run collapse;
+                # any prior finish is irrelevant because the
+                # run was restarted (the duplicate start is
+                # what the contract collapses).
+                entry["started"] = True
+                entry["finished"] = False
+        elif event_name == "optimize_finished":
+            entry = state.get(run_id)
+            if entry is None:
+                # Orphan finish (no prior start): nothing
+                # to clear. A later optimize_started for the
+                # same run_id starts a fresh state entry
+                # independent of this finish, so recording
+                # an intermediate entry adds no information.
+                continue
+            entry["finished"] = True
+    return [
+        run_id
+        for run_id, entry in state.items()
+        if entry["started"] and not entry["finished"]
+    ]
+
+
+def validate_resume_interrupted_runs(
+    interrupted_runs: Sequence[str],
+    *,
+    interactive: bool,
+    confirmed: bool,
+) -> dict[str, object]:
+    """Gate resume of interrupted optimizer runs (Issue #38 / ADR 0017).
+
+    The gate is pure: it takes an already-computed list of
+    interrupted run ids (the output of
+    :func:`detect_interrupted_optimizer_runs`) plus the
+    caller's interactivity and confirmation flags, and returns
+    a ``{"ok", "blockers"}`` payload the CLI can render or
+    ``--json``-emit directly.
+
+    Decision matrix:
+
+    - Empty ``interrupted_runs`` → ``{"ok": True, "blockers": []}``.
+      There is nothing to confirm.
+    - ``confirmed=True`` → ``{"ok": True, "blockers": []}``.
+      The caller explicitly opted in via ``--confirm-resume``
+      (or the interactive prompt); the gate honors that.
+    - Otherwise → ``{"ok": False, "blockers": [...]}`` with a
+      single ``{id, message}`` blocker. The ``id`` is
+      :data:`RESUME_CONFIRMATION_REQUIRED_BLOCKER` for
+      ``interactive=True`` and
+      :data:`RESUME_NON_INTERACTIVE_BLOCKER` for
+      ``interactive=False``. The message names ``--confirm-resume``
+      (non-interactive) or the confirmation requirement
+      (interactive) and embeds the interrupted run ids so the
+      payload is actionable.
+
+    The function never reads stdin, reads history, writes
+    output, accesses environment variables, instantiates
+    storage, or calls other optimizer code. The CLI layer
+    owns those side effects.
+    """
+    if not interrupted_runs:
+        return {"ok": True, "blockers": []}
+    if confirmed:
+        return {"ok": True, "blockers": []}
+    joined_ids = ", ".join(interrupted_runs)
+    if interactive:
+        blocker_id: str = RESUME_CONFIRMATION_REQUIRED_BLOCKER
+        message = (
+            "interactive optimize requires resume confirmation "
+            f"before continuing interrupted run(s): {joined_ids}; "
+            "pass --confirm-resume to acknowledge the resume "
+            "decision (Issue #38 / ADR 0017)"
+        )
+    else:
+        blocker_id = RESUME_NON_INTERACTIVE_BLOCKER
+        message = (
+            "non-interactive optimize cannot resume interrupted "
+            f"run(s) ({joined_ids}) without --confirm-resume; "
+            "aborting to avoid a silent resume (Issue #38 / "
+            "ADR 0017)"
+        )
+    blocker: dict[str, str] = {"id": blocker_id, "message": message}
+    return {"ok": False, "blockers": [blocker]}
 
 
 def _emit_evidence_bundle(
