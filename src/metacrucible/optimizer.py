@@ -56,6 +56,7 @@ from .profiles import (
     ROUTING_SURFACE_CAP,
     evaluate_acceptance,
     evaluate_profile_specs,
+    evaluate_routing_surface_safety,
     select_triggers,
 )
 from .provider_config import (
@@ -89,6 +90,7 @@ __all__ = [
     "STOP_REASON_NO_CANDIDATE_SELECTED",
     "STOP_REASON_PRECONDITION_BLOCKED",
     "STOP_REASON_ROUND_BLOCKED",
+    "STOP_REASON_ROUTING_CONFIRMATION_PREVIEW",
     "RESUME_CONFIRMATION_REQUIRED_BLOCKER",
     "RESUME_NON_INTERACTIVE_BLOCKER",
     "apply_patch_revision",
@@ -217,6 +219,17 @@ STOP_REASON_NO_CANDIDATE_SELECTED: str = "no_candidate_selected"
 STOP_REASON_ROUND_BLOCKED: str = "round_blocked"
 STOP_REASON_PRECONDITION_BLOCKED: str = "precondition_blocked"
 
+#: Stable stop reason emitted when the pipeline short-circuits in
+#: preview mode (Issue #39 / Task 2): the round produced one or
+#: more unconfirmed routing suggestions and ``routing_confirmation_preview=True``
+#: was passed, so the pipeline returned a PREVIEW result with the
+#: pending routing confirmation list and profile verdict evidence
+#: *without* mutating the artifact. The CLI is expected to render
+#: the preview payload and ask the operator to confirm or abort.
+STOP_REASON_ROUTING_CONFIRMATION_PREVIEW: str = (
+    "routing_confirmation_preview"
+)
+
 #: All stop reasons the pipeline may emit. Useful for tests
 #: that want to assert exhaustiveness over the vocabulary.
 STOP_REASONS: frozenset[str] = frozenset({
@@ -226,6 +239,7 @@ STOP_REASONS: frozenset[str] = frozenset({
     STOP_REASON_NO_CANDIDATE_SELECTED,
     STOP_REASON_ROUND_BLOCKED,
     STOP_REASON_PRECONDITION_BLOCKED,
+    STOP_REASON_ROUTING_CONFIRMATION_PREVIEW,
 })
 
 
@@ -612,6 +626,20 @@ class OptimizerPipelineResult:
     #: blocked. The CLI composes this into the ``--json``
     #: payload at the top level.
     stop_reason: str
+    #: Optional preview payload for routing confirmation
+    #: runs (Issue #39 / Task 2). Non-``None`` only when
+    #: the pipeline was invoked with
+    #: :func:`run_optimizer_pipeline` parameter
+    #: ``routing_confirmation_preview=True`` *and* the
+    #: round produced at least one unconfirmed routing
+    #: suggestion. The payload carries the routing
+    #: confirmation records (built by
+    #: :func:`detect_routing_revision_confirmation`), the
+    #: routing-surface-safety profile verdict, the raw
+    #: routing changes the CLI may show in a diff, the
+    #: per-suggestion dicts, and the round id. The
+    #: pipeline never mutates the artifact in this mode.
+    preview: dict[str, Any] | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -1048,6 +1076,129 @@ def validate_routing_revision_confirmation(
             )
         blockers.append({"id": blocker_id, "message": message})
     return {"ok": False, "blockers": blockers}
+
+
+# --------------------------------------------------------------------------- #
+# Routing confirmation preview payload (Issue #39 / Task 2)                  #
+# --------------------------------------------------------------------------- #
+#
+# The preview helper is pure: it takes a non-empty list of
+# unconfirmed routing :class:`EditSuggestion` records, the
+# :class:`OptimizerContext`, and the round id, and returns the
+# structured preview payload the CLI composes into the
+# ``--json`` output. The helper performs no I/O, reads no
+# history, writes no output, accesses no environment variables,
+# and instantiates no storage. The pipeline short-circuits in
+# preview mode without mutating the artifact, so the CLI can
+# render the routing diff + profile evidence and ask the
+# operator to confirm or abort (Task 3 owns the CLI wiring).
+#
+# The payload is intentionally verbose: the CLI is the only
+# consumer, and it needs every field without re-walking the
+# :class:`EditSuggestion` / :class:`OptimizerContext` shape.
+# The shape is:
+#
+#     {
+#         "routing_confirmation": [record, ...],   # detect_routing_revision_confirmation
+#         "profile_verdict": {                       # evaluate_acceptance verdict
+#             "accepted": bool,
+#             "blockers": [...],
+#             "supplemental_findings": [...],
+#         },
+#         "routing_changes": [{"field", "old", "new"}, ...],
+#         "selected_routing_suggestions": [<suggestion.as_dict()>, ...],
+#         "round_id": str,
+#     }
+#
+# ``profile_verdict`` is computed with ``human_confirmed=False``
+# because the preview represents the *unconfirmed* state the
+# CLI is asking the operator to approve; flipping the flag to
+# ``True`` here would make every preview report ``accepted=True``
+# and mask the HITL gate the routing-surface-safety profile
+# is supposed to fire on (the profile is the safety net for
+# an operator who confirms without reading the diff).
+
+#: Stable id for the routing-surface-safety profile. The helper
+#: looks up the corresponding :class:`ProfileSpec` from
+#: :data:`BUILTIN_PROFILES` to feed :func:`evaluate_acceptance`
+#: the spec map the verdict aggregator requires. A defensive
+#: constant so the id is grep-able and the helper does not
+#: depend on a magic string.
+_ROUTING_SURFACE_SAFETY_PROFILE_ID: str = "routing-surface-safety"
+
+
+def _build_routing_confirmation_preview(
+    *,
+    pending_routing: Sequence[EditSuggestion],
+    context: OptimizerContext,
+    round_id: str,
+) -> dict[str, Any]:
+    """Build the preview payload for a routing confirmation request.
+
+    The helper assembles the routing-surface-safety profile
+    verdict from the proposed routing changes (with
+    ``human_confirmed=False``), runs
+    :func:`detect_routing_revision_confirmation` to produce
+    the per-suggestion diff / evidence records, and packages
+    everything with the raw routing changes, the per-suggestion
+    dicts, and the round id. The helper is pure: it performs
+    no I/O and is unit-testable in isolation.
+    """
+    # Index the mutable ranges by ``range_id`` once so the
+    # per-edit ``old`` lookup is O(1). A missing range is the
+    # "no baseline available" case the detector already
+    # handles (the field defaults to the empty string).
+    range_text_by_id: dict[int, str] = {
+        r.range_id: r.text for r in context.mutable_ranges
+    }
+
+    routing_changes: list[dict[str, str]] = []
+    for suggestion in pending_routing:
+        routing_changes.append({
+            "field": suggestion.routing_field,
+            "old": range_text_by_id.get(suggestion.range_id, ""),
+            "new": suggestion.replacement,
+        })
+
+    # Look up the routing-surface-safety profile spec so the
+    # verdict aggregator can identify it as a blocking profile.
+    # A defensive fallback (empty spec map) is used when the
+    # built-in spec is missing; the verdict is still well-formed
+    # but every profile is treated as non-blocking.
+    routing_spec: Any = None
+    for spec in BUILTIN_PROFILES:
+        if spec.id == _ROUTING_SURFACE_SAFETY_PROFILE_ID:
+            routing_spec = spec
+            break
+    spec_map: dict[str, Any] = (
+        {_ROUTING_SURFACE_SAFETY_PROFILE_ID: routing_spec}
+        if routing_spec is not None
+        else {}
+    )
+
+    profile_result = evaluate_routing_surface_safety({
+        "routing_changes": routing_changes,
+        "human_confirmed": False,
+    })
+    profile_verdict = evaluate_acceptance(
+        [profile_result], profile_specs=spec_map
+    )
+
+    routing_confirmation = detect_routing_revision_confirmation(
+        list(pending_routing),
+        context=context,
+        profile_verdict=profile_verdict,
+    )
+
+    return {
+        "routing_confirmation": routing_confirmation,
+        "profile_verdict": profile_verdict,
+        "routing_changes": routing_changes,
+        "selected_routing_suggestions": [
+            s.as_dict() for s in pending_routing
+        ],
+        "round_id": round_id,
+    }
 
 
 def _emit_evidence_bundle(
@@ -1954,6 +2105,7 @@ def run_optimizer_pipeline(
     max_rounds: int = ROUND_BUDGET_DEFAULT,
     human_confirmed: bool = False,
     eval_call_fn: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
+    routing_confirmation_preview: bool = False,
 ) -> OptimizerPipelineResult:
     """Run the full SkillOpt-shaped pipeline (OPT-1..OPT-8).
 
@@ -2007,6 +2159,29 @@ def run_optimizer_pipeline(
         The per-case evaluator (defaults to the F1
         :func:`metacrucible.__main__._evaluate_single_case`
         dispatcher). Tests inject a deterministic stub.
+    routing_confirmation_preview:
+        Routing-confirmation preview mode (Issue #39 /
+        Task 2). ``False`` (default) preserves the normal
+        pipeline: unconfirmed routing edits are rejected
+        with the canonical HITL blocker, confirmed
+        routing edits proceed, non-routing edits apply
+        and evaluate as before. ``True`` runs the
+        pipeline up to the rank / clip step; if the
+        round produced at least one unconfirmed
+        routing suggestion, the pipeline short-circuits
+        and returns an :class:`OptimizerPipelineResult`
+        with ``status="PREVIEW"`` and the
+        ``preview`` field populated with the routing
+        confirmation records, the routing-surface-
+        safety profile verdict, and the per-suggestion
+        diffs. The artifact is *not* mutated; the
+        result carries ``stop_reason=routing_confirmation_preview``.
+        A preview with no unconfirmed routing
+        suggestions falls through to the normal
+        pipeline. The CLI (Task 3) owns the cutover
+        from the legacy ``--confirm-routing`` flag to
+        ``--allow-routing-revision``; this parameter is
+        the only knob the optimizer exposes.
     """
     from .__main__ import _evaluate_single_case  # local import; avoid cycle
 
@@ -2404,10 +2579,18 @@ def run_optimizer_pipeline(
             ordered = [s.suggestion_id for s in suggestions]
             # Routing cap: cap the selected set to one
             # routing change max (and the budget to
-            # RANKED_EDIT_BUDGET total).
+            # RANKED_EDIT_BUDGET total). In preview mode
+            # (Issue #39 / Task 2) the HITL gate does NOT
+            # reject unconfirmed routing edits; instead
+            # they are collected into ``pending_routing``
+            # so the preview short-circuit can build the
+            # confirmation payload and the CLI can ask the
+            # operator to confirm. The cap still applies:
+            # at most one routing edit survives per round.
             selected: list[EditSuggestion] = []
             rejected: list[dict[str, str]] = []
             routing_count = 0
+            pending_routing: list[EditSuggestion] = []
             for s in suggestions:
                 if s.routing:
                     if routing_count >= ROUTING_SURFACE_CAP:
@@ -2429,6 +2612,20 @@ def run_optimizer_pipeline(
                         ))
                         continue
                     if not (s.human_confirmed or context.human_confirmed):
+                        if routing_confirmation_preview:
+                            # Preview mode: collect the
+                            # unconfirmed routing edit into
+                            # ``pending_routing`` so the
+                            # short-circuit below builds
+                            # the preview payload. The
+                            # cap is still honored (the
+                            # first unconfirmed routing
+                            # edit lands in
+                            # ``pending_routing``; the
+                            # second is rejected by the
+                            # cap above).
+                            pending_routing.append(s)
+                            continue
                         rejected.append({
                             "suggestion_id": s.suggestion_id,
                             "reason_id": ROUTING_HITL_UNCONFIRMED_BLOCKER,
@@ -2476,6 +2673,92 @@ def run_optimizer_pipeline(
             )
             _append_history(repo, ranked.as_dict())
             record_counts["ranked_edit_set"] += 1
+
+            # Preview short-circuit (Issue #39 / Task 2).
+            # When preview mode is on and the round
+            # produced at least one unconfirmed routing
+            # suggestion, build the preview payload and
+            # return early with status="PREVIEW". The
+            # pipeline does NOT mutate the artifact, does
+            # NOT run conflict checks, does NOT build a
+            # merge plan, and does NOT call
+            # ``apply_patch_revision``. The CLI renders
+            # the payload, asks the operator to confirm
+            # or abort, and re-invokes the pipeline with
+            # ``human_confirmed=True`` (or skips the
+            # apply). The profile verdict's HITL blocker
+            # is intentionally NOT added to the run-level
+            # ``blockers`` list: the profile verdict is
+            # the evidence the CLI displays, not a
+            # run-level abort signal.
+            if routing_confirmation_preview and pending_routing:
+                preview_payload_local = _build_routing_confirmation_preview(
+                    pending_routing=pending_routing,
+                    context=context,
+                    round_id=round_id,
+                )
+                # Surface a per-round preview event so
+                # the audit lineage carries a
+                # machine-readable trace of the
+                # preview request alongside the
+                # ``optimize_finished`` event the main
+                # flow writes at the end.
+                _append_history(
+                    repo,
+                    {
+                        "event": "optimize_preview",
+                        "run_id": context.run_id,
+                        "round_id": round_id,
+                        "pending_routing_suggestion_ids": [
+                            s.suggestion_id for s in pending_routing
+                        ],
+                        "stop_reason": STOP_REASON_ROUTING_CONFIRMATION_PREVIEW,
+                        "timestamp": _now_iso(),
+                    },
+                )
+                accepted_status = "PREVIEW"
+                stop_reason = STOP_REASON_ROUTING_CONFIRMATION_PREVIEW
+                preview_payload_out = preview_payload_local
+                # Persist the optimize_finished event
+                # here so the audit lineage closes the
+                # run before the early return. The main
+                # flow's evidence-bundle + final
+                # ``optimize_finished`` event is skipped
+                # by the early return; we mirror its
+                # field set so a lineage reader sees a
+                # well-formed close.
+                _append_history(
+                    repo,
+                    {
+                        "event": "optimize_finished",
+                        "run_id": context.run_id,
+                        "status": "PREVIEW",
+                        "rounds": rounds_attempted,
+                        "record_counts": dict(record_counts),
+                        "blockers": [],
+                        "warnings": warnings,
+                        "stop_reason": STOP_REASON_ROUTING_CONFIRMATION_PREVIEW,
+                        "timestamp": _now_iso(),
+                    },
+                )
+                return OptimizerPipelineResult(
+                    status="PREVIEW",
+                    run_id=context.run_id,
+                    rounds=rounds_attempted,
+                    record_counts=record_counts,
+                    evidence_refs={},
+                    blockers=[],
+                    warnings=warnings,
+                    best_revision=None,
+                    acceptance_decision={
+                        "accepted": False,
+                        "reason": "routing_confirmation_preview",
+                    },
+                    selected_candidate_ids=[],
+                    stop_reason=STOP_REASON_ROUTING_CONFIRMATION_PREVIEW,
+                    preview=preview_payload_local,
+                )
+
             if not selected:
                 # Nothing selected this round; the candidate
                 # is empty and we stop.

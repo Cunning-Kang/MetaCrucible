@@ -713,7 +713,12 @@ def test_stop_reason_default_for_clean_exhaustion() -> None:
         f"machine-stable; got {STOP_REASON_MAX_ROUNDS_REACHED!r}"
     )
     # The vocabulary is a frozenset that contains exactly
-    # the six ids the contract enumerates.
+    # the contract stop reasons (six original plus the
+    # ``routing_confirmation_preview`` id introduced by
+    # Issue #39 / Task 2 for the non-mutating preview
+    # short-circuit). The new id is the only addition; a
+    # regression that drops an existing id or introduces
+    # an undeclared one must still fail loud.
     assert STOP_REASONS == frozenset({
         "max_rounds_reached",
         "accepted",
@@ -721,8 +726,9 @@ def test_stop_reason_default_for_clean_exhaustion() -> None:
         "no_candidate_selected",
         "round_blocked",
         "precondition_blocked",
+        "routing_confirmation_preview",
     }), (
-        f"STOP_REASONS must enumerate exactly the six "
+        f"STOP_REASONS must enumerate exactly the seven "
         f"contract stop reasons; got {sorted(STOP_REASONS)!r}"
     )
 
@@ -1500,3 +1506,620 @@ def test_validate_routing_revision_confirmation_confirmed_passes() -> None:
     assert result == {"ok": True, "blockers": []}, (
         f"confirmed record must pass the gate; got result={result!r}"
     )
+
+# --------------------------------------------------------------------------- #
+# Issue #39 / Task 2 — non-mutating routing proposal preview (pipeline)        #
+# --------------------------------------------------------------------------- #
+#
+# These tests pin the ``routing_confirmation_preview=True`` contract on
+# :func:`metacrucible.optimizer.run_optimizer_pipeline`:
+#
+#   * When preview mode is on AND the round produced at least one
+#     unconfirmed routing suggestion, the pipeline returns a
+#     ``PREVIEW`` result with a structured ``preview`` payload and
+#     does NOT mutate the artifact on disk. The legacy
+#     ``routing-hitl-unconfirmed`` rejection id is intentionally
+#     absent from the run-level ``blockers`` list: the profile
+#     verdict surfaces the HITL gate inside the preview payload,
+#     not as a run-level abort.
+#   * When preview mode is on AND every routing suggestion is
+#     confirmed (or there are no routing suggestions at all), the
+#     pipeline runs to completion: a confirmed-only set proceeds
+#     through conflict checks / merge / apply / evaluate exactly
+#     as it would without the preview knob.
+#   * When preview mode is off (the default), the existing
+#     rejection semantics are preserved byte-for-byte: an
+#     unconfirmed routing edit is rejected with the
+#     ``routing-hitl-unconfirmed`` reason id and the pipeline
+#     exits with ``REJECTED`` (no candidate) status.
+#
+# The tests follow the OPT-9 fixture pattern from
+# :mod:`tests.test_optimize_command`: a tiny Skill with a single
+# mutable body range, a benchmark with one eligible eval + one
+# eligible held-out case, and an envelope that declares the
+# artifact path.
+
+
+def _unconfirmed_routing_call_fn(
+    *, body_hash: str, body_text: str
+) -> Any:
+    """Build a ``call_fn`` that returns one unconfirmed routing edit.
+
+    The suggestion targets ``range_id=0`` (the body) and carries
+    ``routing=True`` with ``routing_field="description"`` (a
+    Skill routing surface). ``human_confirmed=False`` so the
+    HITL gate in step 3d would normally reject the edit; the
+    preview tests rely on this default rejection to assert the
+    preview short-circuit fires.
+    """
+    def _call_fn(*, repair_context: Any = None) -> dict[str, Any]:
+        return {
+            "rationale": (
+                "preview-mode regression: one unconfirmed "
+                "routing edit per round"
+            ),
+            "suggested_edits": [
+                {
+                    "range_id": 0,
+                    "base_hash": body_hash,
+                    "intent": "preview_only_routing",
+                    "replacement": body_text,
+                    "rationale": (
+                        "preview-only routing edit on description; "
+                        "human_confirmed=False so the HITL gate would "
+                        "normally reject; preview mode must collect "
+                        "this into pending_routing instead"
+                    ),
+                    "routing": True,
+                    "routing_field": "description",
+                }
+            ],
+        }
+    return _call_fn
+
+
+def _confirmed_routing_call_fn(
+    *, body_hash: str, body_text: str
+) -> Any:
+    """Build a ``call_fn`` that returns one *confirmed* routing edit.
+
+    The suggestion is byte-identical to the unconfirmed variant
+    except ``human_confirmed=True`` on the suggestion, so the
+    preview short-circuit must NOT fire (there is no pending
+    routing edit to confirm) and the pipeline proceeds normally.
+    """
+    def _call_fn(*, repair_context: Any = None) -> dict[str, Any]:
+        return {
+            "rationale": (
+                "preview-mode regression: one confirmed "
+                "routing edit per round"
+            ),
+            "suggested_edits": [
+                {
+                    "range_id": 0,
+                    "base_hash": body_hash,
+                    "intent": "preview_only_routing_confirmed",
+                    "replacement": body_text,
+                    "rationale": (
+                        "preview-only routing edit on description; "
+                        "human_confirmed=True so the preview "
+                        "short-circuit must NOT fire"
+                    ),
+                    "routing": True,
+                    "routing_field": "description",
+                    "human_confirmed": True,
+                }
+            ],
+        }
+    return _call_fn
+
+
+def test_routing_preview_does_not_mutate_artifact(
+    tmp_path: Path,
+) -> None:
+    """Preview mode must not mutate the artifact on disk.
+
+    RED (Task 2 AC1): drive an unconfirmed routing
+    suggestion through ``run_optimizer_pipeline`` with
+    ``routing_confirmation_preview=True`` and assert the
+    artifact file content is byte-for-byte unchanged after
+    the run. The legacy ``routing-hitl-unconfirmed``
+    rejection path would have preserved the bytes too,
+    so this test pins the preview short-circuit
+    specifically: the pipeline must EXIT before
+    ``apply_patch_revision`` would have written the
+    candidate text. A regression that lets the apply
+    step run in preview mode would corrupt the artifact.
+    """
+    import hashlib
+
+    from metacrucible.optimizer import (
+        STOP_REASON_ROUTING_CONFIRMATION_PREVIEW,
+        run_optimizer_pipeline,
+    )
+
+    workspace = _init_workspace(tmp_path)
+    benchmark, artifact = _seed_fixture(workspace)
+    body_hash = hashlib.sha256(
+        _BODY_TEXT.encode("utf-8")
+    ).hexdigest()
+    before_bytes = artifact.read_bytes()
+    call_fn = _unconfirmed_routing_call_fn(
+        body_hash=body_hash, body_text=_BODY_TEXT
+    )
+
+    result = run_optimizer_pipeline(
+        workspace=workspace,
+        benchmark_path=benchmark,
+        artifact_path=artifact,
+        call_fn=call_fn,
+        max_rounds=1,
+        human_confirmed=False,
+        routing_confirmation_preview=True,
+    )
+
+    # The on-disk artifact must be byte-for-byte unchanged.
+    # A regression that runs ``apply_patch_revision`` in
+    # preview mode would write the candidate body (which is
+    # the same as the seed body in this fixture) and the
+    # assert below would still pass — so we also assert the
+    # candidate write was NEVER scheduled, via the result's
+    # status / stop_reason / preview payload below.
+    after_bytes = artifact.read_bytes()
+    assert after_bytes == before_bytes, (
+        f"preview mode must NOT mutate the artifact on "
+        f"disk; before={before_bytes!r} after={after_bytes!r}"
+    )
+    # The result is a structured PREVIEW, not the legacy
+    # REJECTED / BLOCKED path. The machine-stable stop
+    # reason names the preview short-circuit so a
+    # downstream tool can branch on it.
+    assert result.status == "PREVIEW", (
+        f"preview mode must return status=PREVIEW when the "
+        f"round produced an unconfirmed routing edit; got "
+        f"result.status={result.status!r}"
+    )
+    assert (
+        result.stop_reason
+        == STOP_REASON_ROUTING_CONFIRMATION_PREVIEW
+    ), (
+        f"preview mode must set "
+        f"stop_reason={STOP_REASON_ROUTING_CONFIRMATION_PREVIEW!r}; "
+        f"got result.stop_reason={result.stop_reason!r}"
+    )
+    # The preview payload is non-None so the CLI can
+    # render it; the CLI cutover (Task 3) reads the
+    # ``routing_confirmation`` list and the profile
+    # verdict from this mapping.
+    assert result.preview is not None, (
+        f"preview mode must populate result.preview; got "
+        f"result.preview={result.preview!r}"
+    )
+
+
+def test_routing_preview_exposes_machine_readable_confirmation_records(
+    tmp_path: Path,
+) -> None:
+    """Preview mode surfaces a routing confirmation list with the
+    field set the CLI renders.
+
+    RED (Task 2 AC2): the preview payload's
+    ``routing_confirmation`` list is the per-suggestion diff
+    the CLI shows to the operator. Every record must carry
+    ``suggestion_id``, ``routing_field``, ``old``, ``new``,
+    ``intent``, ``rationale``, and the routing-surface-safety
+    profile verdict evidence (``accepted``, ``blockers``,
+    ``supplemental_findings``). A regression that drops a
+    field, mis-keys it, or omits the profile verdict breaks
+    the CLI cutover; the test pins the contract.
+    """
+    import hashlib
+
+    from metacrucible.optimizer import run_optimizer_pipeline
+
+    workspace = _init_workspace(tmp_path)
+    benchmark, artifact = _seed_fixture(workspace)
+    body_hash = hashlib.sha256(
+        _BODY_TEXT.encode("utf-8")
+    ).hexdigest()
+    call_fn = _unconfirmed_routing_call_fn(
+        body_hash=body_hash, body_text=_BODY_TEXT
+    )
+
+    result = run_optimizer_pipeline(
+        workspace=workspace,
+        benchmark_path=benchmark,
+        artifact_path=artifact,
+        call_fn=call_fn,
+        max_rounds=1,
+        human_confirmed=False,
+        routing_confirmation_preview=True,
+    )
+
+    # The preview payload is a mapping with the contract
+    # shape the CLI reads. The exact keys are:
+    #   routing_confirmation, profile_verdict,
+    #   routing_changes, selected_routing_suggestions,
+    #   round_id.
+    assert isinstance(result.preview, dict), (
+        f"result.preview must be a mapping; got "
+        f"type={type(result.preview).__name__}"
+    )
+    records = result.preview.get("routing_confirmation")
+    assert isinstance(records, list), (
+        f"preview['routing_confirmation'] must be a list; "
+        f"got type={type(records).__name__}"
+    )
+    assert len(records) == 1, (
+        f"the unconfirmed-routing fixture must produce "
+        f"exactly one routing confirmation record; got "
+        f"{len(records)} records in {records!r}"
+    )
+    record = records[0]
+    # The CLI renders each of these fields; a missing or
+    # mis-named field is a CLI cutover regression.
+    expected_fields = (
+        "suggestion_id",
+        "routing_field",
+        "old",
+        "new",
+        "intent",
+        "rationale",
+        "accepted",
+        "blockers",
+        "supplemental_findings",
+    )
+    for field_name in expected_fields:
+        assert field_name in record, (
+            f"routing confirmation record must carry "
+            f"field={field_name!r} so the CLI can render "
+            f"the diff + evidence; got record={record!r}"
+        )
+    assert record["suggestion_id"] == "round-01-sug-00", (
+        f"record must carry the suggestion_id for "
+        f"traceability; got record={record!r}"
+    )
+    assert record["routing_field"] == "description", (
+        f"record must carry the routing_field name; got "
+        f"record={record!r}"
+    )
+    assert record["old"] == _BODY_TEXT, (
+        f"record['old'] must carry the mutable range text "
+        f"so the CLI can render the diff; got "
+        f"record={record!r}"
+    )
+    assert record["new"] == _BODY_TEXT, (
+        f"record['new'] must carry the suggestion's "
+        f"replacement text; got record={record!r}"
+    )
+    assert record["intent"] == "preview_only_routing", (
+        f"record['intent'] must carry the suggestion's "
+        f"intent; got record={record!r}"
+    )
+    assert record["rationale"] and isinstance(
+        record["rationale"], str
+    ), (
+        f"record['rationale'] must carry the suggestion's "
+        f"rationale text; got record={record!r}"
+    )
+    # The profile verdict fields are present and reflect
+    # the routing-surface-safety verdict with the HITL
+    # gate fired (human_confirmed=False in the preview).
+    assert record["accepted"] is False, (
+        f"record['accepted'] must surface the profile "
+        f"verdict's accepted flag; a False means the "
+        f"routing-surface-safety profile fired its HITL "
+        f"gate; got record={record!r}"
+    )
+    assert isinstance(record["blockers"], list) and record["blockers"], (
+        f"record['blockers'] must carry at least one "
+        f"routing-surface-safety blocker; got "
+        f"record={record!r}"
+    )
+    hitl_blocker_ids = [
+        b.get("id") for b in record["blockers"]
+        if isinstance(b, dict) and isinstance(b.get("id"), str)
+    ]
+    assert any("hitl" in bid for bid in hitl_blocker_ids), (
+        f"record['blockers'] must include the "
+        f"routing-surface-safety HITL blocker; got "
+        f"blocker ids={hitl_blocker_ids!r}"
+    )
+    # The top-level profile_verdict is also present so
+    # the CLI can render the aggregate verdict without
+    # re-walking each per-suggestion record.
+    profile_verdict = result.preview.get("profile_verdict")
+    assert isinstance(profile_verdict, dict), (
+        f"preview['profile_verdict'] must be a mapping; "
+        f"got type={type(profile_verdict).__name__}"
+    )
+    assert profile_verdict.get("accepted") is False, (
+        f"preview['profile_verdict']['accepted'] must be "
+        f"False for an unconfirmed preview; got "
+        f"profile_verdict={profile_verdict!r}"
+    )
+    assert profile_verdict.get("blockers"), (
+        f"preview['profile_verdict']['blockers'] must be "
+        f"non-empty for an unconfirmed preview; got "
+        f"profile_verdict={profile_verdict!r}"
+    )
+    # The raw routing_changes carry the per-field
+    # {field, old, new} triple the CLI may show in a
+    # diff view.
+    routing_changes = result.preview.get("routing_changes")
+    assert isinstance(routing_changes, list) and len(routing_changes) == 1, (
+        f"preview['routing_changes'] must carry exactly "
+        f"one change for the single unconfirmed routing "
+        f"suggestion; got routing_changes={routing_changes!r}"
+    )
+    change = routing_changes[0]
+    assert change.get("field") == "description", (
+        f"routing_changes entry must carry the "
+        f"routing_field name; got change={change!r}"
+    )
+    assert "old" in change and "new" in change, (
+        f"routing_changes entry must carry 'old' and "
+        f"'new' text; got change={change!r}"
+    )
+
+
+def test_routing_preview_does_not_return_routing_hitl_unconfirmed_blocker(
+    tmp_path: Path,
+) -> None:
+    """Preview mode does not surface the legacy
+    ``routing-hitl-unconfirmed`` blocker before the CLI
+    has had a chance to confirm.
+
+    RED (Task 2 AC3): the legacy rejection path
+    (``routing-hitl-unconfirmed``) is the run-level
+    abort signal a downstream BLOCKED payload would
+    carry. Preview mode replaces that abort with a
+    structured PREVIEW payload: the HITL gate is
+    still observed, but the *signal* the CLI
+    receives is ``status="PREVIEW"`` with the
+    confirmation records on ``result.preview``, not
+    a ``blockers`` list. A regression that
+    double-counts the HITL gate (preview status
+    AND the legacy blocker id) would let a CLI
+    consumer branch on the wrong signal and might
+    trip a BLOCKED abort before the operator has
+    seen the diff.
+    """
+    import hashlib
+
+    from metacrucible.optimizer import (
+        ROUTING_HITL_UNCONFIRMED_BLOCKER,
+        run_optimizer_pipeline,
+    )
+
+    workspace = _init_workspace(tmp_path)
+    benchmark, artifact = _seed_fixture(workspace)
+    body_hash = hashlib.sha256(
+        _BODY_TEXT.encode("utf-8")
+    ).hexdigest()
+    call_fn = _unconfirmed_routing_call_fn(
+        body_hash=body_hash, body_text=_BODY_TEXT
+    )
+
+    result = run_optimizer_pipeline(
+        workspace=workspace,
+        benchmark_path=benchmark,
+        artifact_path=artifact,
+        call_fn=call_fn,
+        max_rounds=1,
+        human_confirmed=False,
+        routing_confirmation_preview=True,
+    )
+
+    # The run-level blockers list is empty in preview
+    # mode: the HITL gate is observed but the abort
+    # signal is the PREVIEW status, not a blocker id.
+    run_blocker_ids = [
+        b.get("id") for b in (result.blockers or [])
+        if isinstance(b, dict)
+    ]
+    assert (
+        ROUTING_HITL_UNCONFIRMED_BLOCKER not in run_blocker_ids
+    ), (
+        f"preview mode must NOT surface the legacy "
+        f"{ROUTING_HITL_UNCONFIRMED_BLOCKER!r} blocker "
+        f"as a run-level blocker; got run_blocker_ids="
+        f"{run_blocker_ids!r}"
+    )
+    # The status is the new PREVIEW value, not BLOCKED.
+    # A regression that flips the status to BLOCKED
+    # would re-introduce the silent-abort behavior the
+    # preview mode is meant to replace.
+    assert result.status != "BLOCKED", (
+        f"preview mode must not return status=BLOCKED; "
+        f"the CLI cutover relies on a structured PREVIEW "
+        f"payload, not a run-level abort; got "
+        f"result.status={result.status!r}"
+    )
+    # The history lineage carries an optimize_preview
+    # event (the per-round preview request) and an
+    # optimize_finished event with status=PREVIEW. A
+    # regression that omits the optimize_preview event
+    # would break the audit trace.
+    finished_events = [
+        r for r in _read_history(workspace)
+        if isinstance(r, dict) and r.get("event") == "optimize_finished"
+    ]
+    assert finished_events, (
+        f"preview mode must persist an optimize_finished "
+        f"event to close the audit lineage; got "
+        f"events={[r.get('event') for r in _read_history(workspace)]!r}"
+    )
+    last_finished = finished_events[-1]
+    assert last_finished.get("status") == "PREVIEW", (
+        f"optimize_finished event must carry status=PREVIEW "
+        f"in preview mode; got "
+        f"status={last_finished.get('status')!r}"
+    )
+    preview_events = [
+        r for r in _read_history(workspace)
+        if isinstance(r, dict) and r.get("event") == "optimize_preview"
+    ]
+    assert preview_events, (
+        f"preview mode must persist an optimize_preview "
+        f"event so the audit lineage carries the "
+        f"machine-readable trace of the preview request; "
+        f"got events="
+        f"{[r.get('event') for r in _read_history(workspace)]!r}"
+    )
+
+
+def test_routing_preview_preserves_normal_pipeline_when_no_pending_routing(
+    tmp_path: Path,
+) -> None:
+    """Preview mode is a no-op when every routing edit is
+    confirmed (or there are no routing edits at all).
+
+    The preview knob is a *guard*, not a transform: if
+    the round has nothing to confirm, the pipeline must
+    run to completion exactly as it would without the
+    knob. The test pins that contract by injecting a
+    confirmed-only routing edit and asserting the result
+    falls through the preview short-circuit.
+    """
+    import hashlib
+
+    from metacrucible.optimizer import (
+        STOP_REASON_ROUTING_CONFIRMATION_PREVIEW,
+        run_optimizer_pipeline,
+    )
+
+    workspace = _init_workspace(tmp_path)
+    benchmark, artifact = _seed_fixture(workspace)
+    body_hash = hashlib.sha256(
+        _BODY_TEXT.encode("utf-8")
+    ).hexdigest()
+    call_fn = _confirmed_routing_call_fn(
+        body_hash=body_hash, body_text=_BODY_TEXT
+    )
+
+    result = run_optimizer_pipeline(
+        workspace=workspace,
+        benchmark_path=benchmark,
+        artifact_path=artifact,
+        call_fn=call_fn,
+        max_rounds=1,
+        human_confirmed=True,
+        routing_confirmation_preview=True,
+    )
+
+    # A confirmed-only round must NOT short-circuit; the
+    # pipeline runs through conflict / merge / apply /
+    # evaluate and exits with a normal verdict. The
+    # specific outcome (ACCEPTED / REJECTED) depends on
+    # the comparator, but the preview-only status and
+    # stop reason must NOT appear.
+    assert result.status != "PREVIEW", (
+        f"preview mode with no pending routing edits "
+        f"must NOT return status=PREVIEW; got "
+        f"result.status={result.status!r}"
+    )
+    assert (
+        result.stop_reason
+        != STOP_REASON_ROUTING_CONFIRMATION_PREVIEW
+    ), (
+        f"preview mode with no pending routing edits "
+        f"must NOT set "
+        f"stop_reason={STOP_REASON_ROUTING_CONFIRMATION_PREVIEW!r}; "
+        f"got result.stop_reason={result.stop_reason!r}"
+    )
+    assert result.preview is None, (
+        f"preview mode with no pending routing edits "
+        f"must leave result.preview=None; got "
+        f"result.preview={result.preview!r}"
+    )
+
+
+def test_routing_preview_preserves_normal_rejection_when_off(
+    tmp_path: Path,
+) -> None:
+    """Preview mode off (the default) preserves the
+    existing rejection semantics for an unconfirmed
+    routing edit.
+
+    A regression that flips the default of
+    ``routing_confirmation_preview`` to ``True`` would
+    silently change the CLI behavior; the test pins the
+    default by omitting the parameter and asserting the
+    legacy rejection path runs. The ranked_edit_set
+    record carries a ``rejected`` entry with
+    ``reason_id=routing-hitl-unconfirmed`` (the same
+    contract the existing
+    ``test_optimize_routing_hitl_unconfirmed_blocks_routing_edit``
+    test pins, restated here so the preview knob's
+    default is regression-tested in this module).
+    """
+    import hashlib
+
+    from metacrucible.optimizer import (
+        ROUTING_HITL_UNCONFIRMED_BLOCKER,
+        run_optimizer_pipeline,
+    )
+
+    workspace = _init_workspace(tmp_path)
+    benchmark, artifact = _seed_fixture(workspace)
+    body_hash = hashlib.sha256(
+        _BODY_TEXT.encode("utf-8")
+    ).hexdigest()
+    call_fn = _unconfirmed_routing_call_fn(
+        body_hash=body_hash, body_text=_BODY_TEXT
+    )
+
+    result = run_optimizer_pipeline(
+        workspace=workspace,
+        benchmark_path=benchmark,
+        artifact_path=artifact,
+        call_fn=call_fn,
+        max_rounds=1,
+        human_confirmed=False,
+        # routing_confirmation_preview omitted on purpose:
+        # the default must preserve the legacy rejection
+        # path so callers that do not know about the new
+        # knob see no behavior change.
+    )
+
+    # The legacy rejection path runs. The status is
+    # either REJECTED (no_candidate_selected; the only
+    # suggestion was rejected by the HITL gate) or
+    # BLOCKED (a downstream conflict), but it must NOT
+    # be PREVIEW.
+    assert result.status != "PREVIEW", (
+        f"preview mode OFF (the default) must NOT return "
+        f"status=PREVIEW; got result.status={result.status!r}"
+    )
+    assert result.preview is None, (
+        f"preview mode OFF (the default) must leave "
+        f"result.preview=None; got result.preview={result.preview!r}"
+    )
+    # The ranked_edit_set record carries the canonical
+    # HITL rejection reason id. The CLI's existing
+    # BLOCKED-payload path branches on this id; the
+    # preview knob must not change the lineage.
+    ranked_records = [
+        r for r in _read_history(workspace)
+        if isinstance(r, dict)
+        and r.get("record_type") == "ranked_edit_set"
+    ]
+    assert ranked_records, (
+        f"pipeline must persist a ranked_edit_set "
+        f"record even when the routing edit is rejected; "
+        f"got {len(ranked_records)} records in history"
+    )
+    last_ranked = ranked_records[-1]
+    rejected = last_ranked.get("rejected") or []
+    hitl_rejections = [
+        r for r in rejected
+        if isinstance(r, dict)
+        and r.get("reason_id") == ROUTING_HITL_UNCONFIRMED_BLOCKER
+    ]
+    assert hitl_rejections, (
+        f"ranked_edit_set.rejected must contain an entry "
+        f"with reason_id={ROUTING_HITL_UNCONFIRMED_BLOCKER!r} "
+        f"when preview mode is OFF; got rejected={rejected!r}"
+    )
+
