@@ -116,6 +116,16 @@ BOOTSTRAP_INVALID_CASE_COUNT_BLOCKER = "bootstrap-invalid-case-count"
 #: "we silently do nothing".
 OPTIMIZE_NOT_IMPLEMENTED_BLOCKER = "optimize-not-implemented"
 
+#: Stable blocker id emitted by ``optimize`` when the workspace
+#: is inside a git worktree and ``git status --porcelain`` reports
+#: dirty files that are not the tracked optimize inputs (the
+#: artifact, ``.metacrucible/envelope.json``, and
+#: ``benchmark.jsonl``). The caller can pass
+#: ``--allow-dirty-unrelated`` to record the dirty file list and
+#: proceed (Issue #31 dirty-file guard; mirrors
+#: :data:`BASELINE_UNRELATED_DIRTY_FILES_BLOCKER`).
+OPTIMIZE_UNRELATED_DIRTY_FILES_BLOCKER = "optimize-unrelated-dirty-files"
+
 # --------------------------------------------------------------------------- #
 # Issue #29 (PRD F1 ``review``) constants                                     #
 # --------------------------------------------------------------------------- #
@@ -571,6 +581,16 @@ def _build_parser() -> argparse.ArgumentParser:
             "routing edit may enter a candidate revision "
             "(ADR 0027 / ADR 0032); without this flag the "
             "routing HITL gate blocks the round"
+        ),
+    )
+    optimize_parser.add_argument(
+        "--allow-dirty-unrelated",
+        action="store_true",
+        help=(
+            "record the dirty-file list and proceed even when the "
+            "git worktree carries dirty files unrelated to the "
+            "optimize inputs (artifact, envelope, benchmark); "
+            "default is to BLOCK on unrelated dirty files"
         ),
     )
     optimize_parser.add_argument(
@@ -2505,6 +2525,63 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         )
         return EXIT_BLOCKED
 
+    # Dirty-file guard (mirrors baseline create). The optimize
+    # inputs (artifact, envelope, benchmark) are not considered
+    # "unrelated" so a freshly-modified artifact does not block
+    # itself. Everything else triggers BLOCK unless
+    # ``--allow-dirty-unrelated`` is set. A workspace outside a
+    # git worktree skips the guard with a stderr warning (per
+    # OD3): the command cannot enforce a commit-before-optimize
+    # policy outside git's purview.
+    optimize_input_paths: list[Path] = [
+        Path(artifact_path_value),
+        Path(".metacrucible/envelope.json"),
+        Path(BENCHMARK_FILE_NAME),
+    ]
+    unrelated_dirty, dirty_paths, is_worktree = git_dirty_check(
+        workspace, optimize_input_paths
+    )
+    if not is_worktree:
+        # Workspace is not a git worktree; skip the dirty
+        # guard with a one-line English warning so the
+        # operator sees the silent-skip. We do not BLOCK.
+        print(
+            "metacrucible: warning: workspace is not a git "
+            "worktree; dirty-file guard skipped (Issue #31 "
+            "OD3)",
+            file=sys.stderr,
+        )
+    elif unrelated_dirty and not args.allow_dirty_unrelated:
+        blockers = [
+            {
+                "id": OPTIMIZE_UNRELATED_DIRTY_FILES_BLOCKER,
+                "message": (
+                    f"workspace has dirty files unrelated to the "
+                    f"optimize inputs (artifact, envelope, "
+                    f"benchmark); pass ``--allow-dirty-unrelated`` "
+                    f"to record the dirty file list and proceed. "
+                    f"dirty_files={dirty_paths!r}"
+                ),
+            }
+        ]
+        _write_optimize_blocked_bundle(blockers=blockers)
+        _emit(
+            {
+                "status": "BLOCKED",
+                "workspace": str(workspace),
+                "benchmark": str(benchmark),
+                "artifact_path": str(artifact_path),
+                "dirty_files_at_run": list(dirty_paths),
+                "allow_dirty_unrelated": bool(
+                    args.allow_dirty_unrelated
+                ),
+                "rounds": 0,
+                "blockers": blockers,
+            },
+            as_json=as_json,
+        )
+        return EXIT_BLOCKED
+
     # Run the pipeline. The CLI passes ``call_fn=None``;
     # tests monkey-patch ``run_optimizer_pipeline`` to
     # inject a deterministic fake. The pipeline is
@@ -2561,6 +2638,8 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         "selected_candidate_ids": list(
             pipeline_result.selected_candidate_ids
         ),
+        "allow_dirty_unrelated": bool(args.allow_dirty_unrelated),
+        "dirty_files_at_run": list(dirty_paths),
     }
     _emit(payload, as_json=as_json)
 
