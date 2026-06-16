@@ -4544,6 +4544,7 @@ def _build_resume_namespace(
     *,
     confirm_resume: bool = False,
     json_output: bool = True,
+    allow_routing_revision: bool = False,
 ) -> "argparse.Namespace":
     """Build a Namespace with the fields ``cmd_optimize`` reads."""
     import argparse as _argparse
@@ -4552,9 +4553,9 @@ def _build_resume_namespace(
         workspace=str(workspace),
         json=json_output,
         max_rounds=1,
-        confirm_routing=False,
         confirm_resume=confirm_resume,
         allow_dirty_unrelated=False,
+        allow_routing_revision=allow_routing_revision,
     )
 
 
@@ -4955,4 +4956,871 @@ def test_optimize_confirmed_resume_retires_interrupted_runs_in_history(
     assert RESUME_CONFIRMATION_REQUIRED_BLOCKER not in blocker_ids2, (
         f"second call must not emit the confirmation blocker; "
         f"got blocker_ids={blocker_ids2!r}"
+    )
+
+
+
+# --------------------------------------------------------------------------- #
+# Issue #39 / Task 3 -- --allow-routing-revision CLI wiring (RED tests)        #
+# --------------------------------------------------------------------------- #
+
+
+def _build_optimize_routing_namespace(
+    workspace: Path,
+    *,
+    allow_routing_revision: bool = False,
+    json_output: bool = True,
+) -> "argparse.Namespace":
+    """Build a Namespace for the ``optimize`` subcommand with the
+    new ``--allow-routing-revision`` flag wired in.
+
+    Mirrors :func:`_build_resume_namespace` but flips the routing
+    confirmation knob. Used by the RED tests in this section.
+    """
+    import argparse as _argparse
+
+    return _argparse.Namespace(
+        workspace=str(workspace),
+        json=json_output,
+        max_rounds=1,
+        confirm_resume=False,
+        allow_dirty_unrelated=False,
+        allow_routing_revision=allow_routing_revision,
+    )
+
+
+def _install_routing_stub_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    preview_records: list[dict[str, Any]] | None = None,
+    preview_profile_verdict: dict[str, Any] | None = None,
+    mutating_status: str = "REJECTED",
+    mutating_run_id: str = "stub-mutating-run",
+    mutating_selected_candidate_ids: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Install a stub ``run_optimizer_pipeline`` for routing tests.
+
+    The stub returns a ``PREVIEW`` result (with the supplied
+    ``preview_records``) on the first call *iff*
+    ``preview_records`` is non-empty. Subsequent calls return a
+    normal mutating-pipeline result. ``mutating_selected_candidate_ids``
+    lets a test assert the preview→apply consistency path: an
+    ACCEPTED mutating result with non-empty selected ids means the
+    routing revision was actually applied (Issue #39 / global
+    review). The call log is returned so each test can assert
+    the preview + mutating sequence and the kwargs each pass
+    carried.
+    """
+    from dataclasses import dataclass as _dataclass
+
+    @_dataclass
+    class _StubResult:
+        status: str = "REJECTED"
+        run_id: str = "stub-run"
+        rounds: int = 0
+        record_counts: dict = None  # type: ignore[assignment]
+        evidence_refs: dict = None  # type: ignore[assignment]
+        blockers: list = None  # type: ignore[assignment]
+        warnings: list = None  # type: ignore[assignment]
+        best_revision = None
+        acceptance_decision: dict = None  # type: ignore[assignment]
+        selected_candidate_ids: list = None  # type: ignore[assignment]
+        stop_reason: str = "no_candidate_edits"
+        preview: Any = None
+
+    calls: list[dict[str, Any]] = []
+    preview_consumed = [False]
+
+    def _stub(*args, **kwargs):
+        kw_copy = dict(kwargs)
+        calls.append({"args": args, "kwargs": kw_copy})
+        is_preview_call = bool(
+            kw_copy.get("routing_confirmation_preview", False)
+        )
+        if (
+            preview_records is not None
+            and is_preview_call
+            and not preview_consumed[0]
+        ):
+            preview_consumed[0] = True
+            profile_verdict = preview_profile_verdict or {
+                "accepted": False,
+                "blockers": [
+                    {
+                        "id": "routing-surface-safety",
+                        "message": (
+                            "routing revision requires explicit "
+                            "human confirmation"
+                        ),
+                    }
+                ],
+                "supplemental_findings": [],
+            }
+            preview_payload = {
+                "routing_confirmation": list(preview_records),
+                "profile_verdict": profile_verdict,
+                "routing_changes": [
+                    {
+                        "field": r["routing_field"],
+                        "old": r["old"],
+                        "new": r["new"],
+                    }
+                    for r in preview_records
+                ],
+                "selected_routing_suggestions": [
+                    {
+                        "suggestion_id": r["suggestion_id"],
+                        "routing_field": r["routing_field"],
+                        "replacement": r["new"],
+                    }
+                    for r in preview_records
+                ],
+                "round_id": "round-1",
+            }
+            return _StubResult(
+                status="PREVIEW",
+                record_counts={},
+                evidence_refs={},
+                blockers=[],
+                warnings=[],
+                acceptance_decision={},
+                selected_candidate_ids=[
+                    r["suggestion_id"] for r in preview_records
+                ],
+                preview=preview_payload,
+            )
+        return _StubResult(
+            status=mutating_status,
+            run_id=mutating_run_id,
+            record_counts={},
+            evidence_refs={},
+            blockers=[],
+            warnings=[],
+            acceptance_decision={},
+            selected_candidate_ids=(
+                list(mutating_selected_candidate_ids)
+                if mutating_selected_candidate_ids is not None
+                else []
+            ),
+        )
+
+    monkeypatch.setattr(
+        "metacrucible.__main__.run_optimizer_pipeline", _stub
+    )
+    return calls
+
+
+def _routing_preview_record(
+    *,
+    suggestion_id: str = "sug-1",
+    routing_field: str = "name",
+    old: str = "opt9-skill",
+    new: str = "opt9-skill-renamed",
+) -> dict[str, Any]:
+    """Build a routing confirmation record matching the
+    :func:`detect_routing_revision_confirmation` shape the
+    pipeline emits on a PREVIEW result.
+    """
+    return {
+        "suggestion_id": suggestion_id,
+        "routing_field": routing_field,
+        "old": old,
+        "new": new,
+        "intent": "rename_skill",
+        "rationale": "improve discoverability",
+        "accepted": False,
+        "blockers": [
+            {
+                "id": "routing-surface-safety",
+                "message": "routing change requires HITL",
+            }
+        ],
+        "supplemental_findings": [],
+    }
+
+
+def test_optimize_parser_accepts_allow_routing_revision_flag() -> None:
+    """AC0 (CLI): the optimize subparser accepts
+    ``--allow-routing-revision`` and exposes the boolean on the
+    namespace so the gate can read it after the preview pass
+    (Issue #39 / Task 3).
+    """
+    from metacrucible.__main__ import _build_parser
+
+    parser = _build_parser()
+    args = parser.parse_args(
+        ["optimize", "/tmp/ws", "--allow-routing-revision"]
+    )
+    assert getattr(args, "allow_routing_revision") is True, (
+        f"--allow-routing-revision must set "
+        f"args.allow_routing_revision=True; got "
+        f"{getattr(args, 'allow_routing_revision', None)!r}"
+    )
+    # The legacy ``--confirm-routing`` knob must be gone so a
+    # blanket pre-confirmation can never happen again.
+    legacy = getattr(args, "confirm_routing", None)
+    assert legacy is None or legacy is False, (
+        f"--confirm-routing must NOT be on the parser anymore; "
+        f"got args.confirm_routing={legacy!r}"
+    )
+
+
+def test_optimize_non_interactive_routing_revision_preview_without_allow_flag_blocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC1 (CLI): non-interactive optimize whose preview surfaces
+    a routing revision must BLOCK with
+    ``ROUTING_REVISION_NON_INTERACTIVE_BLOCKER`` when
+    ``--allow-routing-revision`` is absent. The mutating
+    pipeline pass is NOT called so automation aborts instead
+    of silently applying the routing change (Issue #39 / Task 3).
+    """
+    from metacrucible.__main__ import cmd_optimize
+    from metacrucible.optimizer import (
+        ROUTING_REVISION_NON_INTERACTIVE_BLOCKER,
+    )
+
+    workspace = _init_resume_workspace(tmp_path)
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    prompt_calls: list[str] = []
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt="": prompt_calls.append(prompt) or "",
+    )
+    preview_records = [_routing_preview_record()]
+    pipeline_calls = _install_routing_stub_pipeline(
+        monkeypatch, preview_records=preview_records
+    )
+
+    args = _build_optimize_routing_namespace(
+        workspace, allow_routing_revision=False
+    )
+    rc = cmd_optimize(args)
+    captured = capsys.readouterr()
+
+    assert rc == EXIT_BLOCKED, (
+        f"non-interactive routing preview without "
+        f"--allow-routing-revision must exit {EXIT_BLOCKED}; "
+        f"got rc={rc} stdout={captured.out!r} "
+        f"stderr={captured.err!r}"
+    )
+    try:
+        payload = json.loads(captured.out)
+    except json.JSONDecodeError as exc:
+        pytest.fail(
+            f"optimize --json must emit valid JSON; got "
+            f"stdout={captured.out!r} error={exc}"
+        )
+    assert isinstance(payload, dict)
+    assert payload.get("status") == "BLOCKED", (
+        f"non-interactive routing preview must report "
+        f"status=BLOCKED; got payload={payload!r}"
+    )
+    blocker_ids = [
+        b.get("id") for b in payload.get("blockers", [])
+        if isinstance(b, dict)
+    ]
+    assert ROUTING_REVISION_NON_INTERACTIVE_BLOCKER in blocker_ids, (
+        f"non-interactive routing preview must surface "
+        f"{ROUTING_REVISION_NON_INTERACTIVE_BLOCKER!r}; got "
+        f"blocker_ids={blocker_ids!r}"
+    )
+    routing_revisions = payload.get("routing_revisions")
+    assert isinstance(routing_revisions, list) and routing_revisions, (
+        f"BLOCKED payload must include a non-empty "
+        f"routing_revisions array; got {routing_revisions!r}"
+    )
+    rev = routing_revisions[0]
+    assert rev.get("routing_field") == "name", (
+        f"routing_revisions[0] must carry the routing field; "
+        f"got {rev!r}"
+    )
+    assert rev.get("old") == "opt9-skill", (
+        f"routing_revisions[0] must carry the old text; "
+        f"got {rev!r}"
+    )
+    assert rev.get("new") == "opt9-skill-renamed", (
+        f"routing_revisions[0] must carry the new text; "
+        f"got {rev!r}"
+    )
+    # Profile evidence must surface in the record so the
+    # operator can see why the gate fired.
+    profile_blob = json.dumps(rev, sort_keys=True)
+    assert "routing-surface-safety" in profile_blob, (
+        f"routing_revisions must surface the profile verdict; "
+        f"got rev={rev!r}"
+    )
+    # Exactly one pipeline call (the preview pass). The
+    # mutating pass must NOT run on a non-interactive abort.
+    assert len(pipeline_calls) == 1, (
+        f"only the preview pipeline call must run on "
+        f"non-interactive abort; got pipeline_calls="
+        f"{pipeline_calls!r}"
+    )
+    assert (
+        pipeline_calls[0]["kwargs"].get(
+            "routing_confirmation_preview"
+        )
+        is True
+    ), (
+        f"first pipeline call must be the preview pass with "
+        f"routing_confirmation_preview=True; got "
+        f"{pipeline_calls[0]['kwargs']!r}"
+    )
+    assert (
+        pipeline_calls[0]["kwargs"].get("human_confirmed") is False
+    ), (
+        f"preview pass must run with human_confirmed=False; "
+        f"got {pipeline_calls[0]['kwargs']!r}"
+    )
+    assert prompt_calls == [], (
+        f"non-interactive abort must not prompt; got "
+        f"prompts={prompt_calls!r}"
+    )
+
+
+def test_optimize_interactive_routing_revision_preview_decline_blocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC2 (CLI): interactive optimize whose preview surfaces a
+    routing revision and the operator declines must BLOCK with
+    ``ROUTING_REVISION_CONFIRMATION_REQUIRED_BLOCKER``; the
+    prompt must surface the routing field, old + new values,
+    and the profile evidence; the mutating pipeline pass is
+    NOT called (Issue #39 / Task 3).
+    """
+    from metacrucible.__main__ import cmd_optimize
+    from metacrucible.optimizer import (
+        ROUTING_REVISION_CONFIRMATION_REQUIRED_BLOCKER,
+    )
+
+    workspace = _init_resume_workspace(tmp_path)
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    prompt_calls: list[str] = []
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt="": (prompt_calls.append(prompt), "n")[1],
+    )
+    preview_records = [_routing_preview_record()]
+    pipeline_calls = _install_routing_stub_pipeline(
+        monkeypatch, preview_records=preview_records
+    )
+
+    # HUMAN mode (json_output=False) so the interactive prompt
+    # fires. The source fix in cmd_optimize guards the prompt on
+    # ``not as_json`` so --json mode BLOCKs without prompting.
+    args = _build_optimize_routing_namespace(
+        workspace, allow_routing_revision=False, json_output=False
+    )
+    rc = cmd_optimize(args)
+    captured = capsys.readouterr()
+
+    assert rc == EXIT_BLOCKED, (
+        f"interactive routing preview with decline must exit "
+        f"{EXIT_BLOCKED}; got rc={rc} stdout={captured.out!r} "
+        f"stderr={captured.err!r}"
+    )
+    # Human output renders blockers as "- <id>: <message>" lines.
+    assert ROUTING_REVISION_CONFIRMATION_REQUIRED_BLOCKER in captured.out, (
+        f"interactive decline must surface "
+        f"{ROUTING_REVISION_CONFIRMATION_REQUIRED_BLOCKER!r}; "
+        f"got stdout={captured.out!r}"
+    )
+    assert prompt_calls, "interactive decline branch must prompt"
+    joined_prompt = "\n".join(prompt_calls)
+    assert "name" in joined_prompt, (
+        f"prompt must surface the routing field name; got "
+        f"prompt_calls={prompt_calls!r}"
+    )
+    assert "opt9-skill" in joined_prompt, (
+        f"prompt must surface the old routing text; got "
+        f"prompt_calls={prompt_calls!r}"
+    )
+    assert "opt9-skill-renamed" in joined_prompt, (
+        f"prompt must surface the new routing text; got "
+        f"prompt_calls={prompt_calls!r}"
+    )
+    # Profile evidence must surface in the operator-visible
+    # human output (the BLOCKED payload emits profile_verdict,
+    # which the human renderer prints recursively).
+    assert "routing-surface-safety" in captured.out, (
+        f"output must surface the routing profile verdict; "
+        f"got stdout={captured.out!r}"
+    )
+    # Only the preview pass runs; the mutating pass must NOT
+    # fire after a decline.
+    assert len(pipeline_calls) == 1, (
+        f"only the preview pipeline call must run on "
+        f"interactive decline; got pipeline_calls="
+        f"{pipeline_calls!r}"
+    )
+
+
+def test_optimize_interactive_routing_revision_preview_accept_runs_mutating_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC3 (CLI): interactive optimize whose preview surfaces a
+    routing revision and the operator accepts must call the
+    preview pass first (routing_confirmation_preview=True,
+    human_confirmed=False) and then the mutating pass exactly
+    once with human_confirmed=True. The final payload is the
+    mutating-pipeline payload (Issue #39 / Task 3).
+    """
+    from metacrucible.__main__ import cmd_optimize
+
+    workspace = _init_resume_workspace(tmp_path)
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    prompt_calls: list[str] = []
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt="": (prompt_calls.append(prompt), "y")[1],
+    )
+    preview_records = [_routing_preview_record()]
+    pipeline_calls = _install_routing_stub_pipeline(
+        monkeypatch,
+        preview_records=preview_records,
+        mutating_status="REJECTED",
+        mutating_run_id="mutating-run-1",
+        # Stub the mutating pass as coherent with the
+        # operator-approved routing revision: the apply pass
+        # selected the same suggestion_id the operator
+        # approved, so the post-apply divergence guard
+        # (Issue #39 global review) does not fire and the
+        # test exercises the central exit-code matrix
+        # (REJECTED + no blockers => EXIT_OK).
+        mutating_selected_candidate_ids=[
+            r["suggestion_id"] for r in preview_records
+        ],
+    )
+
+    # HUMAN mode (json_output=False) so the interactive prompt
+    # fires. The source fix in cmd_optimize guards the prompt on
+    # ``not as_json`` so --json mode BLOCKs without prompting.
+    args = _build_optimize_routing_namespace(
+        workspace, allow_routing_revision=False, json_output=False
+    )
+    rc = cmd_optimize(args)
+    captured = capsys.readouterr()
+
+    # Stub mutating pass returns REJECTED with no blockers =>
+    # EXIT_OK (the central exit-code matrix).
+    assert rc == EXIT_OK, (
+        f"interactive accept must reach the mutating "
+        f"pipeline pass (rc={EXIT_OK}); got rc={rc} "
+        f"stdout={captured.out!r} stderr={captured.err!r}"
+    )
+    assert len(pipeline_calls) == 2, (
+        f"interactive accept must call the pipeline exactly "
+        f"twice (preview + mutating); got "
+        f"pipeline_calls={pipeline_calls!r}"
+    )
+    preview_call = pipeline_calls[0]
+    assert (
+        preview_call["kwargs"].get("routing_confirmation_preview")
+        is True
+    ), (
+        f"first call must be the preview pass; got "
+        f"kwargs={preview_call['kwargs']!r}"
+    )
+    assert (
+        preview_call["kwargs"].get("human_confirmed") is False
+    ), (
+        f"preview pass must run with human_confirmed=False; "
+        f"got kwargs={preview_call['kwargs']!r}"
+    )
+    mutating_call = pipeline_calls[1]
+    assert (
+        mutating_call["kwargs"].get("routing_confirmation_preview")
+        is False
+    ), (
+        f"mutating pass must run with "
+        f"routing_confirmation_preview=False; got "
+        f"kwargs={mutating_call['kwargs']!r}"
+    )
+    assert (
+        mutating_call["kwargs"].get("human_confirmed") is True
+    ), (
+        f"mutating pass must run with human_confirmed=True "
+        f"after the operator accepts; got kwargs="
+        f"{mutating_call['kwargs']!r}"
+    )
+    # The mutating run_id must surface in the operator-visible
+    # human output ("run_id: mutating-run-1"), not the preview
+    # stub's id, so an operator can tell the accepted run
+    # made it through the gate.
+    assert "mutating-run-1" in captured.out, (
+        f"final output must report the mutating run_id; got "
+        f"stdout={captured.out!r}"
+    )
+    assert prompt_calls, "interactive accept branch must prompt"
+
+
+def test_optimize_non_interactive_routing_revision_preview_with_allow_flag_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC4 (CLI): non-interactive optimize with
+    ``--allow-routing-revision`` whose preview surfaces a
+    routing revision must NOT prompt, must call the preview
+    pass first, then the mutating pass exactly once with
+    human_confirmed=True. The operator-visible output must
+    still surface the routing diff + profile evidence BEFORE
+    the final pipeline payload (Issue #39 / Task 3).
+    """
+    from metacrucible.__main__ import cmd_optimize
+
+    workspace = _init_resume_workspace(tmp_path)
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    prompt_calls: list[str] = []
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt="": prompt_calls.append(prompt) or "",
+    )
+    preview_records = [_routing_preview_record()]
+    pipeline_calls = _install_routing_stub_pipeline(
+        monkeypatch,
+        preview_records=preview_records,
+        mutating_status="REJECTED",
+        mutating_run_id="mutating-run-2",
+        # Stub the mutating pass as coherent with the
+        # operator-approved routing revision: the apply pass
+        # selected the same suggestion_id the operator
+        # approved, so the post-apply divergence guard
+        # (Issue #39 global review) does not fire and the
+        # test exercises the central exit-code matrix
+        # (REJECTED + no blockers => EXIT_OK).
+        mutating_selected_candidate_ids=[
+            r["suggestion_id"] for r in preview_records
+        ],
+    )
+
+    args = _build_optimize_routing_namespace(
+        workspace, allow_routing_revision=True
+    )
+    rc = cmd_optimize(args)
+    captured = capsys.readouterr()
+
+    assert rc == EXIT_OK, (
+        f"non-interactive --allow-routing-revision must reach "
+        f"the mutating pipeline pass (rc={EXIT_OK}); got "
+        f"rc={rc} stdout={captured.out!r} stderr={captured.err!r}"
+    )
+    assert len(pipeline_calls) == 2, (
+        f"--allow-routing-revision must call the pipeline "
+        f"exactly twice (preview + mutating); got "
+        f"pipeline_calls={pipeline_calls!r}"
+    )
+    mutating_call = pipeline_calls[1]
+    assert (
+        mutating_call["kwargs"].get("human_confirmed") is True
+    ), (
+        f"mutating pass must run with human_confirmed=True "
+        f"when --allow-routing-revision is set; got "
+        f"kwargs={mutating_call['kwargs']!r}"
+    )
+    assert prompt_calls == [], (
+        f"--allow-routing-revision must not prompt in "
+        f"non-interactive mode; got prompts={prompt_calls!r}"
+    )
+    # The JSON payload is the mutating-pipeline payload; the
+    # human / JSON output must still surface the routing diff
+    # and profile evidence before the final result. The
+    # mutating stub does not carry that evidence, so the CLI
+    # must thread it through from the preview payload into the
+    # output for the operator.
+    payload = json.loads(captured.out)
+    assert payload.get("run_id") == "mutating-run-2", (
+        f"final payload must report the mutating run_id; got "
+        f"payload={payload!r}"
+    )
+    routing_revisions = payload.get("routing_revisions")
+    assert isinstance(routing_revisions, list) and routing_revisions, (
+        f"final payload must surface the routing_revisions "
+        f"diff from the preview pass so the operator can see "
+        f"what --allow-routing-revision approved; got "
+        f"{routing_revisions!r}"
+    )
+    blob = json.dumps(routing_revisions, sort_keys=True)
+    assert "name" in blob and "opt9-skill" in blob, (
+        f"routing_revisions must carry field/old/new; got "
+        f"{routing_revisions!r}"
+    )
+
+
+def test_optimize_routing_revision_preview_apply_consistency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Issue #39 / global review: preview→apply consistency.
+
+    After the operator confirms a routing revision in the preview
+    pass, the mutating apply pass must return a result that
+    actually applied the routing: status ``ACCEPTED`` with a
+    non-empty ``selected_candidate_ids``. The CLI must surface
+    the routing diff in the final payload (so the operator can
+    see what was applied) and must exit ``EXIT_OK``.
+
+    This test pins the parity contract at the CLI surface. It
+    does NOT pin any deep content equality between the preview
+    and apply records — the apply result does not expose
+    ``routing_field`` / ``old`` / ``new`` in a structured form,
+    only ``selected_candidate_ids`` and ``best_revision``. The
+    deeper resume-token / deterministic-replay mitigation is
+    post-MVP and is documented in the determinism-invariant
+    comment at the apply call site.
+    """
+    from metacrucible.__main__ import cmd_optimize
+
+    workspace = _init_resume_workspace(tmp_path)
+
+    # Non-interactive: bypass the prompt and force the mutating
+    # pass via the explicit --allow-routing-revision flag.
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    prompt_calls: list[str] = []
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt="": prompt_calls.append(prompt) or "",
+    )
+
+    preview_records = [_routing_preview_record()]
+    pipeline_calls = _install_routing_stub_pipeline(
+        monkeypatch,
+        preview_records=preview_records,
+        mutating_status="ACCEPTED",
+        mutating_run_id="mutating-apply-1",
+        # The mutating pass actually applied the routing
+        # revision; the stub surfaces the preview records'
+        # suggestion_ids so the parity check sees a real
+        # selection.
+        mutating_selected_candidate_ids=[
+            r["suggestion_id"] for r in preview_records
+        ],
+    )
+
+    args = _build_optimize_routing_namespace(
+        workspace, allow_routing_revision=True
+    )
+    rc = cmd_optimize(args)
+    captured = capsys.readouterr()
+
+    # The apply pass with a non-empty selected_candidate_ids
+    # is the "routing actually applied" outcome; the central
+    # exit-code matrix maps ACCEPTED + no blockers to EXIT_OK.
+    assert rc == EXIT_OK, (
+        f"preview->apply consistency: ACCEPTED apply pass with "
+        f"non-empty selected_candidate_ids must exit "
+        f"{EXIT_OK}; got rc={rc} stdout={captured.out!r} "
+        f"stderr={captured.err!r}"
+    )
+    # Exactly two pipeline calls: preview then mutating.
+    assert len(pipeline_calls) == 2, (
+        f"preview->apply consistency must run preview + "
+        f"mutating exactly once each; got pipeline_calls="
+        f"{pipeline_calls!r}"
+    )
+    preview_call = pipeline_calls[0]
+    mutating_call = pipeline_calls[1]
+    assert (
+        preview_call["kwargs"].get("routing_confirmation_preview")
+        is True
+    ), (
+        f"first call must be the preview pass; got "
+        f"kwargs={preview_call['kwargs']!r}"
+    )
+    assert (
+        preview_call["kwargs"].get("human_confirmed") is False
+    ), (
+        f"preview pass must run with human_confirmed=False; "
+        f"got kwargs={preview_call['kwargs']!r}"
+    )
+    assert (
+        mutating_call["kwargs"].get("routing_confirmation_preview")
+        is False
+    ), (
+        f"mutating pass must run with "
+        f"routing_confirmation_preview=False; got "
+        f"kwargs={mutating_call['kwargs']!r}"
+    )
+    assert (
+        mutating_call["kwargs"].get("human_confirmed") is True
+    ), (
+        f"mutating pass must run with human_confirmed=True "
+        f"after --allow-routing-revision; got kwargs="
+        f"{mutating_call['kwargs']!r}"
+    )
+    assert prompt_calls == [], (
+        f"--allow-routing-revision must not prompt in "
+        f"non-interactive mode; got prompts={prompt_calls!r}"
+    )
+
+    # The final JSON payload is the mutating-pipeline payload.
+    # It must surface the routing_revisions diff from the preview
+    # pass so the operator sees what was applied, and must
+    # report the mutating run_id so it is distinguishable from
+    # the preview run.
+    try:
+        payload = json.loads(captured.out)
+    except json.JSONDecodeError as exc:
+        pytest.fail(
+            f"optimize --json must emit valid JSON; got "
+            f"stdout={captured.out!r} error={exc}"
+        )
+    assert isinstance(payload, dict)
+    assert payload.get("status") == "ACCEPTED", (
+        f"final payload must reflect the mutating apply "
+        f"status=ACCEPTED; got payload={payload!r}"
+    )
+    assert payload.get("run_id") == "mutating-apply-1", (
+        f"final payload must report the mutating run_id; "
+        f"got payload={payload!r}"
+    )
+    selected = payload.get("selected_candidate_ids")
+    assert isinstance(selected, list) and selected, (
+        f"final payload must carry a non-empty "
+        f"selected_candidate_ids list documenting the applied "
+        f"routing revision; got {selected!r}"
+    )
+    routing_revisions = payload.get("routing_revisions")
+    assert isinstance(routing_revisions, list) and routing_revisions, (
+        f"final payload must surface the routing_revisions "
+        f"diff so the operator can see what "
+        f"--allow-routing-revision approved; got "
+        f"{routing_revisions!r}"
+    )
+    blob = json.dumps(routing_revisions, sort_keys=True)
+    assert "name" in blob and "opt9-skill" in blob, (
+        f"routing_revisions must carry field/old/new; got "
+        f"{routing_revisions!r}"
+    )
+
+
+def test_optimize_routing_revision_preview_apply_divergence_blocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Issue #39 global review: post-apply divergence guard.
+
+    If the operator approves a routing revision in the preview
+    pass and the mutating apply pass returns
+    ``selected_candidate_ids`` that do NOT intersect the
+    approved ``suggestion_id`` set, the CLI must BLOCK with
+    ``ROUTING_REVISION_DIVERGENCE_BLOCKER`` rather than
+    silently accept an unapproved routing change. With
+    ``call_fn=None`` this divergence is impossible
+    (deterministic), but a future real ``call_fn`` could
+    surface a different routing set in the apply pass than
+    what the operator just approved in the preview — the
+    guard pins the contract at the CLI surface so a future
+    non-deterministic ``call_fn`` is caught, not silently
+    accepted.
+    """
+    from metacrucible.__main__ import cmd_optimize
+
+    workspace = _init_resume_workspace(tmp_path)
+
+    # Non-interactive: bypass the prompt and force the mutating
+    # pass via the explicit --allow-routing-revision flag.
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    prompt_calls: list[str] = []
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt="": prompt_calls.append(prompt) or "",
+    )
+
+    # Preview surfaces suggestion_id="sug-1". The mutating pass
+    # returns a disjoint selected_candidate_ids list (e.g. the
+    # LLM produced different suggestions on the second pass).
+    preview_records = [_routing_preview_record()]
+    pipeline_calls = _install_routing_stub_pipeline(
+        monkeypatch,
+        preview_records=preview_records,
+        mutating_status="ACCEPTED",
+        mutating_run_id="mutating-apply-divergent",
+        # Divergent: the apply pass selected a suggestion_id
+        # that the operator did NOT approve in the preview.
+        mutating_selected_candidate_ids=["different-id"],
+    )
+
+    args = _build_optimize_routing_namespace(
+        workspace, allow_routing_revision=True
+    )
+    rc = cmd_optimize(args)
+    captured = capsys.readouterr()
+
+    # The CLI must exit EXIT_BLOCKED and emit the stable
+    # divergence blocker id (Issue #39 global review). The
+    # blocker id is the machine contract; the message is
+    # operator-readable prose.
+    assert rc == EXIT_BLOCKED, (
+        f"preview->apply divergence must BLOCK "
+        f"(rc={EXIT_BLOCKED}); got rc={rc} "
+        f"stdout={captured.out!r} stderr={captured.err!r}"
+    )
+    try:
+        payload = json.loads(captured.out)
+    except json.JSONDecodeError as exc:
+        pytest.fail(
+            f"optimize --json must emit valid JSON on "
+            f"divergence; got stdout={captured.out!r} "
+            f"error={exc}"
+        )
+    assert isinstance(payload, dict)
+    assert payload.get("status") == "BLOCKED", (
+        f"divergence payload must have status=BLOCKED; "
+        f"got payload={payload!r}"
+    )
+    blockers = payload.get("blockers")
+    assert isinstance(blockers, list) and blockers, (
+        f"divergence payload must carry a non-empty "
+        f"blockers list; got {blockers!r}"
+    )
+    blocker_ids = [b.get("id") for b in blockers]
+    assert "routing-revision-divergence" in blocker_ids, (
+        f"divergence payload must contain "
+        f"ROUTING_REVISION_DIVERGENCE_BLOCKER "
+        f"id=routing-revision-divergence; got "
+        f"blocker_ids={blocker_ids!r} payload={payload!r}"
+    )
+
+    # The payload must surface both the approved
+    # suggestion_ids and the apply pass's selected_candidate_ids
+    # so an operator / auditor can see exactly what diverged.
+    approved = payload.get("approved_suggestion_ids")
+    assert approved == ["sug-1"], (
+        f"divergence payload must surface the approved "
+        f"suggestion_ids from the preview; got "
+        f"approved={approved!r} payload={payload!r}"
+    )
+    selected = payload.get("selected_candidate_ids")
+    assert selected == ["different-id"], (
+        f"divergence payload must surface the apply "
+        f"pass's selected_candidate_ids; got "
+        f"selected={selected!r} payload={payload!r}"
+    )
+
+    # Sanity: the mutating pass ran exactly once and the
+    # divergence guard fired BEFORE the central payload
+    # composition (so the divergence blockers did NOT get
+    # clobbered by the ACCEPTED-status happy path).
+    assert len(pipeline_calls) == 2, (
+        f"divergence guard must run after preview + "
+        f"mutating exactly once each; got pipeline_calls="
+        f"{pipeline_calls!r}"
+    )
+    assert prompt_calls == [], (
+        f"--allow-routing-revision must not prompt in "
+        f"non-interactive mode; got prompts={prompt_calls!r}"
     )
