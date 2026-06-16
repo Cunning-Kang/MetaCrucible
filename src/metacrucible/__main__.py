@@ -65,6 +65,7 @@ from typing import Any, Mapping, Sequence
 from . import __version__
 from .benchmark import SPLIT_EVAL, SPLIT_HELD_OUT, STATUS_GENERATED
 from .blocked_bundles import write_blocked_bundle
+from .dirty_guard import git_dirty_check
 from .exit_codes import (
     EXIT_BLOCKED,
     EXIT_INTERNAL_ERROR,
@@ -2758,90 +2759,14 @@ def cmd_review(args: argparse.Namespace) -> int:
 def _baseline_git_dirty_check(
     workspace: Path, baseline_inputs: list[Path]
 ) -> tuple[bool, list[str], bool]:
-    """Inspect the workspace's git state and classify dirty files.
+    """Thin wrapper around :func:`git_dirty_check`.
 
-    Returns a triple ``(unrelated_dirty, dirty_paths, is_worktree)``:
-
-      - ``is_worktree`` is ``True`` iff ``git rev-parse
-        --is-inside-work-tree`` returns ``true`` for ``workspace``.
-        A non-worktree workspace (no git integration, or the
-        workspace lives outside any git toplevel) is not gated
-        by the dirty guard: the caller is expected to commit
-        before baselining but the command cannot enforce that
-        outside a worktree. A warning is surfaced via
-        ``is_worktree=False`` so the operator can see the skip.
-      - ``dirty_paths`` is the raw ``git status --porcelain``
-        output, normalized to repo-relative paths (no
-        renames/copies handling beyond the basic case).
-      - ``unrelated_dirty`` is ``True`` iff at least one
-        ``dirty_paths`` entry is not one of the ``baseline_inputs``
-        (resolved against ``workspace``). The filter is
-        permissive: a path matches an input when the resolved
-        absolute paths are equal.
-
-    The function never raises; subprocess errors and unreadable
-    output are downgraded to ``is_worktree=False`` so the caller
-    can branch on a tri-state without exception handling.
+    Preserved as a private symbol so existing baseline call
+    sites and any test that intentionally references the
+    private name keep working. The reusable logic lives in
+    :mod:`metacrucible.dirty_guard`.
     """
-    try:
-        probe = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(workspace),
-                "rev-parse",
-                "--is-inside-work-tree",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return False, [], False
-    if probe.returncode != 0 or probe.stdout.strip() != "true":
-        return False, [], False
-
-    try:
-        status = subprocess.run(
-            ["git", "-C", str(workspace), "status", "--porcelain"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return False, [], True
-    if status.returncode != 0:
-        return False, [], True
-
-    dirty: list[str] = []
-    for raw_line in status.stdout.splitlines():
-        if len(raw_line) < 4:
-            continue
-        # Porcelain v1: ``XY<space>PATH`` where XY is the index +
-        # worktree status code. Renames/copies carry
-        # ``ORIG -> PATH``; the second component is the
-        # post-rename path so we keep that.
-        path_str = raw_line[3:].strip()
-        if " -> " in path_str:
-            path_str = path_str.split(" -> ", 1)[1]
-        # Git may quote paths that contain special characters
-        # (``"foo bar"``); the basic workspace fixtures do not
-        # exercise that path so we only handle the unquoted
-        # case for the MVP. The downstream resolver still
-        # catches escape mismatches.
-        if path_str.startswith('"') and path_str.endswith('"'):
-            path_str = path_str[1:-1]
-        dirty.append(path_str)
-
-    input_abs = {
-        (workspace / rel).resolve() for rel in baseline_inputs
-    }
-    unrelated: list[str] = []
-    for entry in dirty:
-        candidate = (workspace / entry).resolve()
-        if candidate not in input_abs:
-            unrelated.append(entry)
-    return bool(unrelated), dirty, True
+    return git_dirty_check(workspace, baseline_inputs)
 
 
 def _write_evaluate_blocked_bundle(
