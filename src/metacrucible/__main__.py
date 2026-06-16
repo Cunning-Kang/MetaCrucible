@@ -58,6 +58,7 @@ from .optimizer import (
     detect_interrupted_optimizer_runs,
     run_optimizer_pipeline,
     validate_resume_interrupted_runs,
+    validate_routing_revision_confirmation,
 )
 import subprocess
 import hashlib
@@ -576,13 +577,16 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     optimize_parser.add_argument(
-        "--confirm-routing",
+        "--allow-routing-revision",
         action="store_true",
         help=(
-            "explicit human confirmation that any selected "
-            "routing edit may enter a candidate revision "
-            "(ADR 0027 / ADR 0032); without this flag the "
-            "routing HITL gate blocks the round"
+            "explicit human confirmation that a routing "
+            "revision (a change to a routing-surface field) "
+            "may enter a candidate revision (Issue #39 / ADR "
+            "0027 / ADR 0032); without this flag a non-"
+            "interactive optimize BLOCKs when the pipeline "
+            "proposes a routing revision; interactive mode "
+            "prompts the operator instead"
         ),
     )
     optimize_parser.add_argument(
@@ -2345,8 +2349,17 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         bootstrap-sentinel blocker so a generated case or
         ``BOOTSTRAP_PENDING_REVIEW`` flag still refuses
         the start (the existing test contract).
-      - Threads ``--max-rounds`` and ``--confirm-routing``
-        through to the pipeline.
+      - Threads ``--max-rounds`` and ``--allow-routing-revision``
+        through to the routing-revision preview / gate flow
+        (Issue #39 / Task 3). The pipeline is first invoked
+        with ``routing_confirmation_preview=True`` /
+        ``human_confirmed=False``; if it short-circuits with a
+        ``PREVIEW`` result the CLI renders the routing diff +
+        profile evidence, prompts interactively (or honors the
+        flag), validates via
+        :func:`validate_routing_revision_confirmation`, and
+        either BLOCKs or invokes the mutating pass with
+        ``human_confirmed=True``.
       - Emits the human / ``--json`` payload per the
         :func:`cmd_optimize` output contract (status,
         rounds, decision, blockers, warnings, record
@@ -2376,7 +2389,16 @@ def cmd_optimize(args: argparse.Namespace) -> int:
     )
     if max_rounds < 1:
         max_rounds = 1
-    human_confirmed = bool(getattr(args, "confirm_routing", False))
+    # The ``--allow-routing-revision`` flag is *deferred*: it
+    # is consumed only after the routing preview / gate flow
+    # below decides the operator wants to apply the routing
+    # revision. Reading it eagerly here would re-introduce the
+    # legacy ``--confirm-routing`` blanket pre-confirmation
+    # path that the new gate is designed to retire (Issue #39 /
+    # Task 3).
+    allow_routing_revision = bool(
+        getattr(args, "allow_routing_revision", False)
+    )
 
     # Precondition 1: workspace must be an existing directory.
     if not workspace.is_dir():
@@ -2682,14 +2704,187 @@ def cmd_optimize(args: argparse.Namespace) -> int:
     # inject a deterministic fake. The pipeline is
     # bounded by ``max_rounds``; the CLI never loops
     # forever.
+    # Routing-revision preview / gate (Issue #39 / Task 3).
+    # The first pipeline call runs in preview mode
+    # (``routing_confirmation_preview=True``,
+    # ``human_confirmed=False``) so the pipeline short-circuits
+    # the moment it would apply a routing revision. The result
+    # is one of two shapes:
+    #
+    #   - ``status != "PREVIEW"``: the round produced no
+    #     unconfirmed routing suggestions, so the preview call
+    #     *is* the normal pipeline call. The pipeline already
+    #     ran to completion (apply + evaluate + acceptance)
+    #     and we use the result directly without a second
+    #     pipeline pass.
+    #   - ``status == "PREVIEW"``: the round surfaced at least
+    #     one routing suggestion that needs explicit human
+    #     confirmation. The CLI renders the routing diff +
+    #     profile evidence, prompts interactively (when stdin
+    #     is a TTY), validates via
+    #     :func:`validate_routing_revision_confirmation`, and
+    #     either BLOCKs or invokes the mutating pass with
+    #     ``human_confirmed=True``.
+    #
+    # The preview / gate / apply flow lives *after* the
+    # #38 interrupted-run gate so stale runs are retired before
+    # we propose new routing revisions.
+    interactive = sys.stdin.isatty()
+    # When the preview pass surfaces a routing revision the operator
+    # explicitly approves (via prompt or ``--allow-routing-revision``),
+    # remember the preview payload so the final operator-visible
+    # payload can still carry the diff + profile evidence. The mutating
+    # pass does not echo the preview records itself. The defaults are
+    # safe for the non-preview path (no routing revision proposed).
+    approved_routing_revisions: list[dict[str, Any]] = []
+    approved_profile_verdict: dict[str, Any] = {}
     pipeline_result: OptimizerPipelineResult = run_optimizer_pipeline(
         workspace=workspace,
         benchmark_path=benchmark,
         artifact_path=artifact_path,
         call_fn=None,
         max_rounds=max_rounds,
-        human_confirmed=human_confirmed,
+        human_confirmed=False,
+        routing_confirmation_preview=True,
     )
+
+    if pipeline_result.status == "PREVIEW":
+        # The pipeline ran a non-mutating preview pass; surface
+        # the routing diff + profile evidence to the operator
+        # and decide whether to apply the routing revision.
+        preview_payload = pipeline_result.preview or {}
+        routing_records_raw = preview_payload.get(
+            "routing_confirmation", []
+        )
+        routing_records: list[dict[str, Any]] = [
+            dict(r) for r in routing_records_raw
+            if isinstance(r, dict)
+        ]
+        profile_verdict_raw = preview_payload.get("profile_verdict")
+        profile_verdict: dict[str, Any] = (
+            dict(profile_verdict_raw)
+            if isinstance(profile_verdict_raw, dict)
+            else {}
+        )
+        approved_routing_revisions = list(routing_records)
+        approved_profile_verdict = dict(profile_verdict)
+
+        # Render the routing diff to stdout *before* the
+        # operator-visible confirmation so a human reviewing
+        # the command output (no TTY) sees the same evidence a
+        # human sitting at a terminal would see. The human
+        # surface keeps the prose English-only (Issue #27
+        # task 27.4); the JSON surface carries the full record.
+        if not as_json and routing_records:
+            for record in routing_records:
+                routing_field = str(
+                    record.get("routing_field", "")
+                )
+                old_text = str(record.get("old", ""))
+                new_text = str(record.get("new", ""))
+                suggestion_id = str(
+                    record.get("suggestion_id", "")
+                )
+                print(
+                    "routing revision proposed: "
+                    f"routing_field={routing_field!r} "
+                    f"suggestion_id={suggestion_id!r} "
+                    f"old={old_text!r} new={new_text!r}"
+                )
+            if profile_verdict:
+                blockers = profile_verdict.get("blockers", [])
+                if isinstance(blockers, list) and blockers:
+                    for blocker in blockers:
+                        if not isinstance(blocker, dict):
+                            continue
+                        print(
+                            "routing-surface-safety blocker: "
+                            f"{blocker.get('id', '')!r} "
+                            f"{blocker.get('message', '')!r}"
+                        )
+
+        # Determine confirmation. ``--allow-routing-revision``
+        # is the explicit non-interactive opt-in. Interactive
+        # mode without the flag prompts the operator and
+        # accepts only ``y`` / ``yes``; an EOF (e.g. piped
+        # stdin without a TTY) is treated as a decline.
+        confirmed = bool(allow_routing_revision)
+        # In ``--json`` mode we MUST NOT write prompt prose to
+        # stdout (it would corrupt the JSON stream). The
+        # operator is expected to re-run with
+        # ``--allow-routing-revision`` for non-interactive
+        # approval; otherwise the gate below BLOCKs.
+        if not confirmed and interactive and not as_json:
+            prompt_lines: list[str] = []
+            for record in routing_records:
+                prompt_lines.append(
+                    "routing revision proposed: "
+                    f"routing_field="
+                    f"{record.get('routing_field', '')!r} "
+                    f"old={record.get('old', '')!r} "
+                    f"new={record.get('new', '')!r} "
+                    f"suggestion_id="
+                    f"{record.get('suggestion_id', '')!r}"
+                )
+            prompt_lines.append(
+                "Apply the routing revision above? "
+                "Type 'y' or 'yes' to continue, anything "
+                "else to abort (Issue #39): "
+            )
+            prompt_text = "\n".join(prompt_lines)
+            try:
+                answer = input(prompt_text)
+            except EOFError:
+                answer = ""
+            if answer.strip().lower() in ("y", "yes"):
+                confirmed = True
+
+        gate = validate_routing_revision_confirmation(
+            routing_records,
+            interactive=interactive,
+            confirmed=confirmed,
+        )
+        if not gate["ok"]:
+            blockers = list(gate["blockers"])
+            _write_optimize_blocked_bundle(blockers=blockers)
+            blocked_payload: dict[str, Any] = {
+                "status": "BLOCKED",
+                "workspace": str(workspace),
+                "benchmark": str(benchmark),
+                "artifact_path": str(artifact_path),
+                "allow_dirty_unrelated": bool(
+                    args.allow_dirty_unrelated
+                ),
+                "dirty_files_at_run": list(dirty_paths),
+                "routing_revisions": routing_records,
+                "profile_verdict": profile_verdict,
+                "rounds": 0,
+                "blockers": blockers,
+            }
+            _emit(blocked_payload, as_json=as_json)
+            return EXIT_BLOCKED
+
+        # Gate passed: invoke the mutating pipeline pass with
+        # ``human_confirmed=True`` so
+        # ``_check_routing_violations`` and
+        # ``evaluate_routing_surface_safety`` see explicit
+        # human confirmation.
+        # Determinism invariant: both the preview pass above
+        # and this mutating pass pass ``call_fn=None`` so
+        # routing detection / suggestion-id derivation is
+        # stable across the two calls. If a future caller
+        # injects a real ``call_fn`` here, the apply pass
+        # could surface routing records that differ from
+        # what the operator just approved in the preview.
+        pipeline_result = run_optimizer_pipeline(
+            workspace=workspace,
+            benchmark_path=benchmark,
+            artifact_path=artifact_path,
+            call_fn=None,
+            max_rounds=max_rounds,
+            human_confirmed=True,
+            routing_confirmation_preview=False,
+        )
 
     # Compose the OPT-8 / OPT-9 output. The status field
     # is the machine-stable verdict: ``ACCEPTED`` /
@@ -2737,6 +2932,20 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         "dirty_files_at_run": list(dirty_paths),
         "stop_reason": pipeline_result.stop_reason,
     }
+    # When the preview pass surfaced a routing revision the
+    # operator explicitly approved (via prompt or
+    # ``--allow-routing-revision``), the operator-visible
+    # payload must still carry the diff + profile evidence so
+    # the on-the-wire record shows what was approved (the
+    # mutating pass does not echo the preview records itself).
+    if approved_routing_revisions:
+        payload["routing_revisions"] = list(
+            approved_routing_revisions
+        )
+        if approved_profile_verdict:
+            payload["profile_verdict"] = dict(
+                approved_profile_verdict
+            )
     _emit(payload, as_json=as_json)
 
     if pipeline_result.status in ("ACCEPTED", "REJECTED"):
