@@ -2640,6 +2640,7 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         ),
         "allow_dirty_unrelated": bool(args.allow_dirty_unrelated),
         "dirty_files_at_run": list(dirty_paths),
+        "stop_reason": pipeline_result.stop_reason,
     }
     _emit(payload, as_json=as_json)
 
