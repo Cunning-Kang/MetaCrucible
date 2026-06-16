@@ -887,3 +887,234 @@ def test_max_rounds_not_exceeded_under_continuous_rejection(
         f"the seed bytes after each rejection); got "
         f"artifact bytes={artifact.read_bytes()!r}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Issue #38 — interrupted-run detection + resume gate (pure)                   #
+# --------------------------------------------------------------------------- #
+
+
+def test_detect_interrupted_optimizer_runs_empty_history_returns_empty() -> None:
+    """An empty history stream has no interrupted runs.
+
+    Issue #38 / ADR 0017: detection operates on an already-loaded
+    iterable of history events. The trivial empty case must yield
+    an empty list without raising.
+    """
+    from metacrucible.optimizer import detect_interrupted_optimizer_runs
+
+    assert detect_interrupted_optimizer_runs([]) == []
+
+
+def test_detect_interrupted_optimizer_runs_matching_finish_clears_start() -> None:
+    """A matching ``optimize_finished`` clears its started run.
+
+    The detection contract: an interrupted run is an
+    ``optimize_started`` event with NO matching
+    ``optimize_finished`` event for the same ``run_id``. The
+    matched pair must drop out of the result.
+    """
+    from metacrucible.optimizer import detect_interrupted_optimizer_runs
+
+    history = [
+        {"event": "optimize_started", "run_id": "opt-20260616-abcdef12"},
+        {"event": "optimize_finished", "run_id": "opt-20260616-abcdef12"},
+    ]
+    assert detect_interrupted_optimizer_runs(history) == []
+
+
+def test_detect_interrupted_optimizer_runs_unfinished_run_is_returned() -> None:
+    """An ``optimize_started`` with no matching finish is interrupted.
+
+    The single interrupted ``run_id`` must appear in the result.
+    """
+    from metacrucible.optimizer import detect_interrupted_optimizer_runs
+
+    history = [
+        {"event": "optimize_started", "run_id": "opt-20260616-abcdef12"},
+    ]
+    assert detect_interrupted_optimizer_runs(history) == [
+        "opt-20260616-abcdef12"
+    ]
+
+
+def test_detect_interrupted_optimizer_runs_multiple_unfinished_first_seen_order() -> None:
+    """Multiple unfinished runs are returned in first-seen start order.
+
+    The detection contract preserves the first-seen start order
+    so downstream callers (CLI surfacing) see a deterministic
+    list. Duplicate starts for the same unfinished run must
+    collapse to a single entry.
+    """
+    from metacrucible.optimizer import detect_interrupted_optimizer_runs
+
+    history = [
+        {"event": "optimize_started", "run_id": "opt-20260616-aaaaaaaa"},
+        {"event": "optimize_started", "run_id": "opt-20260616-bbbbbbbb"},
+        {"event": "optimize_started", "run_id": "opt-20260616-cccccccc"},
+        # Duplicate start for the first run; the matching
+        # finish never arrives so it stays interrupted.
+        {"event": "optimize_started", "run_id": "opt-20260616-aaaaaaaa"},
+    ]
+    assert detect_interrupted_optimizer_runs(history) == [
+        "opt-20260616-aaaaaaaa",
+        "opt-20260616-bbbbbbbb",
+        "opt-20260616-cccccccc",
+    ]
+
+
+def test_detect_interrupted_optimizer_runs_finish_for_unrelated_run_id_does_not_clear() -> None:
+    """A finish event for an unrelated ``run_id`` does NOT clear a started run.
+
+    The detection contract is keyed on ``run_id``: a finish for
+    run X must not retroactively clear a started run Y. Both
+    unfinished runs appear in first-seen order.
+    """
+    from metacrucible.optimizer import detect_interrupted_optimizer_runs
+
+    history = [
+        {"event": "optimize_started", "run_id": "opt-20260616-aaaaaaaa"},
+        # Finish for a completely different run id; must NOT
+        # clear the started run above.
+        {"event": "optimize_finished", "run_id": "opt-20260616-bbbbbbbb"},
+        {"event": "optimize_started", "run_id": "opt-20260616-bbbbbbbb"},
+    ]
+    assert detect_interrupted_optimizer_runs(history) == [
+        "opt-20260616-aaaaaaaa",
+        "opt-20260616-bbbbbbbb",
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# validate_resume_interrupted_runs — pure gate                                #
+# --------------------------------------------------------------------------- #
+
+
+def test_validate_resume_interrupted_runs_empty_passes() -> None:
+    """No interrupted runs → ok=True with empty blockers.
+
+    The gate short-circuits on an empty interrupt list: there is
+    nothing to confirm and no resume decision to make.
+    """
+    from metacrucible.optimizer import validate_resume_interrupted_runs
+
+    result = validate_resume_interrupted_runs(
+        [],
+        interactive=False,
+        confirmed=False,
+    )
+    assert result == {"ok": True, "blockers": []}, (
+        f"empty interrupted_runs must pass the gate; got {result!r}"
+    )
+
+
+def test_validate_resume_interrupted_runs_non_interactive_without_confirm_blocks() -> None:
+    """Non-interactive optimize without --confirm-resume BLOCKS.
+
+    ADR 0017 + AC: a non-interactive caller cannot silently resume
+    an interrupted run; the gate requires an explicit
+    ``--confirm-resume`` flag or the run aborts. The blocker
+    message must mention ``--confirm-resume`` so automation can
+    branch on it without parsing free-form text.
+    """
+    from metacrucible.optimizer import validate_resume_interrupted_runs
+
+    result = validate_resume_interrupted_runs(
+        ["opt-20260616-abcdef12"],
+        interactive=False,
+        confirmed=False,
+    )
+    assert result.get("ok") is False, (
+        f"non-interactive + no confirm + interrupted run must "
+        f"BLOCK; got result={result!r}"
+    )
+    blockers = result.get("blockers") or []
+    assert blockers, (
+        f"BLOCKED result must carry at least one blocker; "
+        f"got blockers={blockers!r}"
+    )
+    joined = " ".join(str(b.get("message", "")) for b in blockers)
+    assert "--confirm-resume" in joined, (
+        f"non-interactive blocker must mention --confirm-resume "
+        f"so automation knows how to opt in; got blockers={blockers!r}"
+    )
+    # The interrupted run id must be present in the payload so
+    # the BLOCKED result is actionable.
+    assert any(
+        "opt-20260616-abcdef12" in (str(b.get("message", "")) + str(b))
+        for b in blockers
+    ), (
+        f"blocker payload must include the interrupted run_id "
+        f"for traceability; got blockers={blockers!r}"
+    )
+
+
+def test_validate_resume_interrupted_runs_interactive_without_confirm_blocks() -> None:
+    """Interactive optimize without confirmation BLOCKS.
+
+    ADR 0017 + AC: an interactive caller with an interrupted
+    run still must explicitly confirm resume — the gate does
+    not auto-prompt; it BLOCKS so the CLI can surface the
+    blocker and ask. The blocker message must reference the
+    confirmation requirement.
+    """
+    from metacrucible.optimizer import validate_resume_interrupted_runs
+
+    result = validate_resume_interrupted_runs(
+        ["opt-20260616-abcdef12"],
+        interactive=True,
+        confirmed=False,
+    )
+    assert result.get("ok") is False, (
+        f"interactive + no confirm + interrupted run must "
+        f"BLOCK; got result={result!r}"
+    )
+    blockers = result.get("blockers") or []
+    assert blockers, (
+        f"BLOCKED result must carry at least one blocker; "
+        f"got blockers={blockers!r}"
+    )
+    joined = " ".join(str(b.get("message", "")) for b in blockers).lower()
+    assert "confirm" in joined, (
+        f"interactive blocker must reference confirmation; "
+        f"got blockers={blockers!r}"
+    )
+
+
+def test_validate_resume_interrupted_runs_interactive_with_confirm_passes() -> None:
+    """Interactive optimize WITH confirmation PASSES.
+
+    The positive path: the caller confirmed the resume and the
+    gate returns ok=True with no blockers.
+    """
+    from metacrucible.optimizer import validate_resume_interrupted_runs
+
+    result = validate_resume_interrupted_runs(
+        ["opt-20260616-abcdef12"],
+        interactive=True,
+        confirmed=True,
+    )
+    assert result == {"ok": True, "blockers": []}, (
+        f"interactive + confirmed must pass the gate; "
+        f"got result={result!r}"
+    )
+
+
+def test_validate_resume_interrupted_runs_non_interactive_with_confirm_passes() -> None:
+    """Non-interactive optimize WITH --confirm-resume PASSES.
+
+    The automation path: the caller passed the explicit
+    ``--confirm-resume`` flag and the gate honors it without
+    requiring an interactive prompt.
+    """
+    from metacrucible.optimizer import validate_resume_interrupted_runs
+
+    result = validate_resume_interrupted_runs(
+        ["opt-20260616-abcdef12"],
+        interactive=False,
+        confirmed=True,
+    )
+    assert result == {"ok": True, "blockers": []}, (
+        f"non-interactive + --confirm-resume must pass the gate; "
+        f"got result={result!r}"
+    )
