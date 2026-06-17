@@ -863,3 +863,607 @@ def test_synthesize_blocks_when_output_exists(
         f"no .metacrucible/ must be created when output already "
         f"exists; got {(output / '.metacrucible')!r}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Task 3 command-level tests (Issue #41 / PRD F4)                            #
+# --------------------------------------------------------------------------- #
+
+def _reviewed_synthesis_workspace(
+    tmp_path: Path,
+    *,
+    capability_need: str = "write a skill to summarize documents",
+    leave_generated: bool = False,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> Path:
+    """Seed a synthesis workspace whose benchmark cases are reviewed.
+
+    The helper invokes :func:`metacrucible.__main__.cmd_synthesize`
+    once to create the workspace (Task 2 default shape: pending
+    generated cases carrying the ``BOOTSTRAP_PENDING_REVIEW``
+    sentinel), then rewrites ``benchmark.jsonl`` so the case
+    records look human-reviewed:
+
+      - ``status`` -> ``reviewed``,
+      - ``reviewed`` -> ``True``,
+      - :data:`metacrucible.synthesize.BOOTSTRAP_PENDING_REVIEW_FIELD`
+        is removed.
+
+    Split, ``case_id``, and the metadata record are preserved
+    so the resulting workspace is indistinguishable from a
+    promote-then-re-run shape: the same case_ids, the same
+    artifact path, the same envelope, the same baseline
+    mapping, the same split partition. When
+    ``leave_generated`` is ``True`` the helper skips the
+    rewrite and returns the freshly-created workspace (the
+    pending-review state).
+
+    The ``capsys`` fixture is read + cleared after the
+    bootstrap call so the helper's emit does not bleed
+    into the test's own ``captured.out`` assertion.
+
+    Time is frozen via :func:`metacrucible.__main__._now_iso`
+    so the case_ids and history events are byte-stable across
+    runs.
+    """
+    from metacrucible import __main__ as cli_main
+
+    monkeypatch.setattr(cli_main, "_now_iso", lambda: FROZEN_NOW)
+    ns = _synthesize_namespace(
+        tmp_path=tmp_path,
+        capability_need=capability_need,
+        from_spec=None,
+    )
+    rc = cli_main.cmd_synthesize(ns)
+    assert rc == EXIT_OK, (
+        f"workspace bootstrap synthesize must return EXIT_OK; "
+        f"got rc={rc}"
+    )
+    # Drain the bootstrap call's emit so the test's own
+    # ``captured.out`` carries only the resume call.
+    capsys.readouterr()
+    workspace = tmp_path / "skill"
+    if leave_generated:
+        return workspace
+    benchmark_path = workspace / BENCHMARK_FILE_NAME
+    records = _read_benchmark_records(benchmark_path)
+    new_records: list[dict[str, object]] = []
+    for record in records:
+        if record.get("record_type") == "metadata":
+            new_records.append(dict(record))
+            continue
+        rewritten = dict(record)
+        rewritten["status"] = "reviewed"
+        rewritten["reviewed"] = True
+        rewritten.pop(BOOTSTRAP_PENDING_REVIEW_FIELD, None)
+        new_records.append(rewritten)
+    _write_jsonl(benchmark_path, new_records)
+    return workspace
+
+
+def _write_jsonl(path: Path, records: list[dict[str, object]]) -> Path:
+    """Write ``records`` as one JSON object per line at ``path``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [json.dumps(dict(rec), sort_keys=True) for rec in records]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def assert_payloads_equal_modulo_volatile(
+    create: dict[str, object],
+    resume: dict[str, object],
+    *,
+    volatile: frozenset[str] = frozenset({"created_at"}),
+) -> None:
+    """Assert the create-success and resume payloads are field-by-field equal.
+
+    The ``_emit_pending_review_payload`` docstring claims the
+    create-success and resume short-circuit payloads are
+    "indistinguishable" so a downstream consumer cannot tell
+    the difference between a fresh draft-pending-review and a
+    re-invocation that short-circuited because the operator has
+    not yet reviewed the generated cases. This helper pins that
+    contract in tests by asserting field-by-field equality
+    between the two payloads.
+
+    ``volatile`` defaults to ``{"created_at"}`` (the helper's
+    ``_now_iso`` is patched per-call, so timestamps may differ
+    if the test ever relaxes the freeze). Tests can override the
+    set to add or remove fields as the payload contract evolves.
+    """
+    create_filtered = {
+        k: v for k, v in create.items() if k not in volatile
+    }
+    resume_filtered = {
+        k: v for k, v in resume.items() if k not in volatile
+    }
+    assert create_filtered == resume_filtered, (
+        f"create and resume payloads must be field-by-field equal "
+        f"modulo {set(volatile)!r}; "
+        f"create_keys={sorted(create_filtered.keys())!r} "
+        f"resume_keys={sorted(resume_filtered.keys())!r} "
+        f"create_only={sorted(set(create_filtered) - set(resume_filtered))!r} "
+        f"resume_only={sorted(set(resume_filtered) - set(create_filtered))!r} "
+        f"value_diffs={sorted(k for k in create_filtered if k in resume_filtered and create_filtered[k] != resume_filtered[k])!r}"
+    )
+
+
+def test_synthesize_reviewed_workspace_runs_optimizer_and_accepts(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC3 (command, reviewed workspace, optimizer ACCEPTED):
+    ``cmd_synthesize`` invoked against an existing synthesis
+    workspace whose benchmark has reviewed eval + held-out
+    cases runs the F3 optimizer and returns
+    :data:`metacrucible.exit_codes.EXIT_OK` with
+    ``outcome='accepted'`` when the pipeline reports
+    ``status='ACCEPTED'`` and
+    ``acceptance_decision.accepted is True``.
+
+    The test pins the dispatch contract end-to-end:
+
+      - The optimizer entrypoint is called exactly once with
+        ``workspace``, ``benchmark_path``, ``artifact_path``,
+        ``max_rounds`` (from the dispatcher), ``call_fn=None``,
+        ``human_confirmed=False``, and
+        ``routing_confirmation_preview=True``.
+      - The JSON payload is parseable, has
+        ``status='OK'`` and ``outcome='accepted'``, and
+        carries the optimizer ``acceptance_decision``,
+        ``evidence_refs``, ``record_counts``, and
+        ``selected_candidate_ids`` pass-through fields.
+      - History records ``synthesis_optimizer_started`` and
+        ``synthesis_finished`` are appended to
+        ``<workspace>/.metacrucible/history.jsonl`` so the
+        audit lineage carries the synthesize-then-optimize
+        sequence.
+    """
+    from dataclasses import dataclass
+    from metacrucible import synthesize as synth_mod
+    from metacrucible import __main__ as cli_main
+
+    workspace = _reviewed_synthesis_workspace(
+        tmp_path, monkeypatch=monkeypatch, capsys=capsys
+    )
+    benchmark_path = workspace / BENCHMARK_FILE_NAME
+    # Pull the artifact path off the envelope (the optimizer
+    # receives whatever the envelope declared).
+    envelope = json.loads(
+        (workspace / ".metacrucible" / "envelope.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    artifact_path = envelope["artifact_path"]
+
+    @dataclass
+    class _StubResult:
+        status: str = "ACCEPTED"
+        run_id: str = "stub-run-accepted"
+        rounds: int = 1
+        record_counts: dict[str, int] = None  # type: ignore[assignment]
+        evidence_refs: dict[str, str] = None  # type: ignore[assignment]
+        blockers: list = None  # type: ignore[assignment]
+        warnings: list = None  # type: ignore[assignment]
+        best_revision: dict | None = None
+        acceptance_decision: dict = None  # type: ignore[assignment]
+        selected_candidate_ids: list = None  # type: ignore[assignment]
+        stop_reason: str = "accepted"
+        preview: dict | None = None
+
+    evidence_refs = {
+        "receipt": "/tmp/evidence/stub-run-accepted/receipt.json",
+        "summary": "/tmp/evidence/stub-run-accepted/summary.json",
+    }
+    call_log: list[dict[str, object]] = []
+
+    def _stub(**kwargs: object) -> _StubResult:
+        call_log.append(dict(kwargs))
+        return _StubResult(
+            record_counts={"case_eval": 1, "case_held_out": 1},
+            evidence_refs=evidence_refs,
+            blockers=[],
+            warnings=[],
+            best_revision=None,
+            acceptance_decision={
+                "accepted": True,
+                "reason": "accepted",
+            },
+            selected_candidate_ids=["cand-1"],
+        )
+
+    monkeypatch.setattr(synth_mod, "run_optimizer_pipeline", _stub)
+
+    ns = _synthesize_namespace(
+        tmp_path=tmp_path,
+        capability_need=None,
+        from_spec=None,
+    )
+    rc = cli_main.cmd_synthesize(ns)
+    captured = capsys.readouterr()
+
+    assert rc == EXIT_OK, (
+        f"reviewed-workspace synthesize must return EXIT_OK when "
+        f"optimizer accepts; got rc={rc} stdout={captured.out!r} "
+        f"stderr={captured.err!r}"
+    )
+    payload = json.loads(captured.out)
+    assert payload.get("status") == "OK", (
+        f"payload status must be 'OK' on accepted resume; got "
+        f"{payload.get('status')!r}"
+    )
+    assert payload.get("outcome") == "accepted", (
+        f"payload outcome must be 'accepted' on accepted resume; "
+        f"got {payload.get('outcome')!r}"
+    )
+    assert len(call_log) == 1, (
+        f"optimizer entrypoint must be called exactly once on "
+        f"reviewed resume; got {len(call_log)} calls"
+    )
+    call = call_log[0]
+    assert call.get("workspace") == workspace, (
+        f"optimizer must be called with the synthesis workspace; "
+        f"got workspace={call.get('workspace')!r} expected={workspace!r}"
+    )
+    assert call.get("benchmark_path") == benchmark_path, (
+        f"optimizer must be called with the workspace benchmark; "
+        f"got benchmark_path={call.get('benchmark_path')!r} "
+        f"expected={benchmark_path!r}"
+    )
+    assert call.get("artifact_path") == Path(artifact_path), (
+        f"optimizer must be called with the envelope-declared "
+        f"artifact path; got artifact_path={call.get('artifact_path')!r} "
+        f"expected={artifact_path!r}"
+    )
+    assert call.get("call_fn") is None, (
+        f"optimizer must be called with call_fn=None in the MVP "
+        f"synthesize-resume path; got call_fn={call.get('call_fn')!r}"
+    )
+    assert call.get("human_confirmed") is False, (
+        f"optimizer must be called with human_confirmed=False in "
+        f"the synthesize-resume path; got "
+        f"human_confirmed={call.get('human_confirmed')!r}"
+    )
+    assert call.get("routing_confirmation_preview") is True, (
+        f"optimizer must be called with "
+        f"routing_confirmation_preview=True in the synthesize-"
+        f"resume path (the F3 preview/gate flow owns routing "
+        f"confirmation); got "
+        f"routing_confirmation_preview={call.get('routing_confirmation_preview')!r}"
+    )
+    assert call.get("max_rounds") == ROUND_BUDGET_DEFAULT, (
+        f"optimizer must be called with max_rounds from the "
+        f"dispatcher ({ROUND_BUDGET_DEFAULT}); got "
+        f"max_rounds={call.get('max_rounds')!r}"
+    )
+    # Payload carries the optimizer pass-through fields.
+    assert payload.get("acceptance_decision") == {
+        "accepted": True,
+        "reason": "accepted",
+    }, (
+        f"payload must carry the optimizer acceptance_decision "
+        f"verbatim; got {payload.get('acceptance_decision')!r}"
+    )
+    assert payload.get("evidence_refs") == evidence_refs, (
+        f"payload must carry the optimizer evidence_refs; got "
+        f"{payload.get('evidence_refs')!r}"
+    )
+    assert payload.get("record_counts") == {
+        "case_eval": 1,
+        "case_held_out": 1,
+    }, (
+        f"payload must carry the optimizer record_counts; got "
+        f"{payload.get('record_counts')!r}"
+    )
+    assert payload.get("selected_candidate_ids") == ["cand-1"], (
+        f"payload must carry the optimizer selected_candidate_ids; "
+        f"got {payload.get('selected_candidate_ids')!r}"
+    )
+    assert payload.get("blockers") == [], (
+        f"accepted payload blockers must be empty; got "
+        f"{payload.get('blockers')!r}"
+    )
+
+    # History: synthesis_optimizer_started + synthesis_finished
+    # bracket the optimizer call. The pre-existing Task 2 events
+    # (synthesis_started, baseline_recorded,
+    # generated_cases_created, synthesis_pending_review) are
+    # preserved.
+    history_lines = [
+        json.loads(line)
+        for line in (workspace / ".metacrucible" / "history.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    history_events = [r["event"] for r in history_lines]
+    assert "synthesis_optimizer_started" in history_events, (
+        f"history must carry a synthesis_optimizer_started event; "
+        f"got events={history_events!r}"
+    )
+    assert "synthesis_finished" in history_events, (
+        f"history must carry a synthesis_finished event; got "
+        f"events={history_events!r}"
+    )
+    started_idx = history_events.index("synthesis_optimizer_started")
+    finished_idx = history_events.index("synthesis_finished")
+    assert started_idx < finished_idx, (
+        f"synthesis_optimizer_started must come BEFORE "
+        f"synthesis_finished in history; got started_idx="
+        f"{started_idx} finished_idx={finished_idx}"
+    )
+    finished_record = history_lines[finished_idx]
+    assert finished_record.get("outcome") == "accepted", (
+        f"synthesis_finished must carry outcome='accepted'; got "
+        f"{finished_record!r}"
+    )
+    assert finished_record.get("stop_reason") == "accepted", (
+        f"synthesis_finished must carry the optimizer stop_reason; "
+        f"got {finished_record!r}"
+    )
+
+
+def test_synthesize_reviewed_workspace_aborts_when_optimizer_rejects(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC3 (command, reviewed workspace, optimizer REJECTED):
+    ``cmd_synthesize`` invoked against an existing synthesis
+    workspace whose benchmark has reviewed eval + held-out
+    cases runs the F3 optimizer and returns
+    :data:`metacrucible.exit_codes.EXIT_BLOCKED` with
+    ``outcome='aborted'`` when the pipeline reports
+    ``status='REJECTED'`` and
+    ``acceptance_decision.accepted is False``.
+
+    The test pins the dispatcher mapping for the rejected
+    path:
+
+      - exit code is :data:`metacrucible.exit_codes.EXIT_BLOCKED`,
+      - ``status='BLOCKED'`` and ``outcome='aborted'``,
+      - the payload carries the optimizer's ``blockers``,
+        ``warnings``, ``evidence_refs``, ``record_counts``,
+        ``rounds``, ``stop_reason``, and
+        ``acceptance_decision`` fields verbatim so a
+        downstream operator can reconstruct why the run
+        stopped,
+      - the payload does NOT include an ``accepted`` flag
+        on the top-level outcome (the outcome string is the
+        only machine-stable signal).
+    """
+    from dataclasses import dataclass
+    from metacrucible import synthesize as synth_mod
+    from metacrucible import __main__ as cli_main
+
+    workspace = _reviewed_synthesis_workspace(
+        tmp_path, monkeypatch=monkeypatch, capsys=capsys
+    )
+
+    @dataclass
+    class _StubResult:
+        status: str = "REJECTED"
+        run_id: str = "stub-run-rejected"
+        rounds: int = 1
+        record_counts: dict[str, int] = None  # type: ignore[assignment]
+        evidence_refs: dict[str, str] = None  # type: ignore[assignment]
+        blockers: list = None  # type: ignore[assignment]
+        warnings: list = None  # type: ignore[assignment]
+        best_revision: dict | None = None
+        acceptance_decision: dict = None  # type: ignore[assignment]
+        selected_candidate_ids: list = None  # type: ignore[assignment]
+        stop_reason: str = "max_rounds_reached"
+        preview: dict | None = None
+
+    blocker_record = {
+        "id": "no-eval-improvement",
+        "message": "candidate did not improve eval pass-rate",
+    }
+    evidence_refs = {
+        "receipt": "/tmp/evidence/stub-run-rejected/receipt.json",
+    }
+    def _stub(**kwargs: object) -> _StubResult:
+        return _StubResult(
+            record_counts={"case_eval": 1, "case_held_out": 1},
+            evidence_refs=evidence_refs,
+            blockers=[blocker_record],
+            warnings=[],
+            best_revision=None,
+            acceptance_decision={
+                "accepted": False,
+                "reason": "no_eval_improvement",
+            },
+            selected_candidate_ids=[],
+        )
+
+    monkeypatch.setattr(synth_mod, "run_optimizer_pipeline", _stub)
+
+    ns = _synthesize_namespace(
+        tmp_path=tmp_path,
+        capability_need=None,
+        from_spec=None,
+    )
+    rc = cli_main.cmd_synthesize(ns)
+    captured = capsys.readouterr()
+
+    assert rc == EXIT_BLOCKED, (
+        f"reviewed-workspace synthesize must return EXIT_BLOCKED "
+        f"when the optimizer rejects; got rc={rc} stdout="
+        f"{captured.out!r} stderr={captured.err!r}"
+    )
+    payload = json.loads(captured.out)
+    assert payload.get("status") == "BLOCKED", (
+        f"aborted payload status must be 'BLOCKED'; got "
+        f"{payload.get('status')!r}"
+    )
+    assert payload.get("outcome") == "aborted", (
+        f"aborted payload outcome must be 'aborted'; got "
+        f"{payload.get('outcome')!r}"
+    )
+    # The top-level payload must NOT include an ``accepted``
+    # flag — the outcome string is the single machine-stable
+    # signal (consistent with the other ``OK`` / ``BLOCKED``
+    # outcome mappings in the CLI).
+    assert "accepted" not in payload, (
+        f"aborted payload must NOT carry a top-level 'accepted' "
+        f"flag; got payload={payload!r}"
+    )
+    assert payload.get("blockers") == [blocker_record], (
+        f"aborted payload must carry the optimizer blockers "
+        f"verbatim; got {payload.get('blockers')!r}"
+    )
+    assert payload.get("evidence_refs") == evidence_refs, (
+        f"aborted payload must carry the optimizer evidence_refs "
+        f"verbatim; got {payload.get('evidence_refs')!r}"
+    )
+    assert payload.get("record_counts") == {
+        "case_eval": 1,
+        "case_held_out": 1,
+    }, (
+        f"aborted payload must carry the optimizer record_counts "
+        f"verbatim; got {payload.get('record_counts')!r}"
+    )
+    assert payload.get("rounds") == 1, (
+        f"aborted payload must carry the optimizer rounds; got "
+        f"{payload.get('rounds')!r}"
+    )
+    assert payload.get("stop_reason") == "max_rounds_reached", (
+        f"aborted payload must carry the optimizer stop_reason; "
+        f"got {payload.get('stop_reason')!r}"
+    )
+    assert payload.get("acceptance_decision") == {
+        "accepted": False,
+        "reason": "no_eval_improvement",
+    }, (
+        f"aborted payload must carry the optimizer "
+        f"acceptance_decision; got "
+        f"{payload.get('acceptance_decision')!r}"
+    )
+    # The synthesize_finished history event carries the
+    # aborted outcome and the same stop_reason the payload
+    # exposes.
+    history_lines = [
+        json.loads(line)
+        for line in (workspace / ".metacrucible" / "history.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    history_events = [r["event"] for r in history_lines]
+    assert "synthesis_finished" in history_events
+    finished = next(
+        r for r in history_lines if r["event"] == "synthesis_finished"
+    )
+    assert finished.get("outcome") == "aborted", (
+        f"synthesis_finished outcome must be 'aborted' on the "
+        f"rejected path; got {finished!r}"
+    )
+    assert finished.get("stop_reason") == "max_rounds_reached", (
+        f"synthesis_finished stop_reason must mirror the "
+        f"optimizer stop_reason; got {finished!r}"
+    )
+
+
+def test_synthesize_keeps_pending_review_without_optimizer_call(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC3 (command, pending-review workspace): ``cmd_synthesize``
+    invoked against an existing synthesis workspace whose
+    benchmark still carries pending generated cases (the
+    default Task 2 shape) short-circuits BEFORE the optimizer
+    call and returns the existing ``draft_pending_review``
+    payload shape + :data:`metacrucible.exit_codes.EXIT_OK`.
+
+    The test pins the contract that the optimizer entrypoint
+    is NEVER called when pending cases are present: the
+    stub raises ``RuntimeError`` on call, and the test
+    expects the synthesize command to return EXIT_OK with
+    ``outcome='draft_pending_review'`` and the original
+    ``BOOTSTRAP_PENDING_REVIEW`` sentinel in the payload.
+    A downstream operator can then review + promote the
+    cases and re-invoke synthesize to trigger the
+    optimizer.
+
+    The test also pins the contract that the create-success
+    payload and the resume short-circuit payload are
+    field-by-field equal (modulo volatile ``created_at``):
+    ``_emit_pending_review_payload`` claims the two are
+    "indistinguishable" so a downstream consumer cannot tell
+    the difference between a fresh draft-pending-review and a
+    re-invocation that short-circuited. The first
+    ``cmd_synthesize`` call (on the same ``tmp_path``)
+    captures the create-success payload; the second call
+    captures the resume short-circuit payload; the helper
+    ``assert_payloads_equal_modulo_volatile`` pins the
+    equality end-to-end.
+    """
+    from metacrucible import synthesize as synth_mod
+    from metacrucible import __main__ as cli_main
+
+    # 1. Create the workspace and capture the create-success
+    #    payload. The workspace lives under ``tmp_path/skill``
+    #    and the resume re-invocation targets the same path, so
+    #    the two payloads reference the same workspace /
+    #    artifact / benchmark files.
+    monkeypatch.setattr(cli_main, "_now_iso", lambda: FROZEN_NOW)
+    create_ns = _synthesize_namespace(
+        tmp_path=tmp_path,
+        capability_need="write a skill to summarize documents",
+        from_spec=None,
+    )
+    rc_create = cli_main.cmd_synthesize(create_ns)
+    assert rc_create == EXIT_OK, (
+        f"workspace bootstrap synthesize must return EXIT_OK; "
+        f"got rc={rc_create}"
+    )
+    create_payload = json.loads(capsys.readouterr().out)
+
+    def _must_not_call(**kwargs: object) -> object:
+        raise RuntimeError(
+            "run_optimizer_pipeline must not be called when "
+            "the synthesis workspace still carries pending "
+            "generated cases"
+        )
+
+    monkeypatch.setattr(
+        synth_mod, "run_optimizer_pipeline", _must_not_call
+    )
+
+    ns = _synthesize_namespace(
+        tmp_path=tmp_path,
+        capability_need=None,
+        from_spec=None,
+    )
+    rc = cli_main.cmd_synthesize(ns)
+    captured = capsys.readouterr()
+
+    assert rc == EXIT_OK, (
+        f"pending-review re-invocation must return EXIT_OK "
+        f"with outcome=draft_pending_review; got rc={rc} "
+        f"stdout={captured.out!r} stderr={captured.err!r}"
+    )
+    payload = json.loads(captured.out)
+    assert payload.get("status") == "OK", (
+        f"pending-review payload status must be 'OK'; got "
+        f"{payload.get('status')!r}"
+    )
+    assert (
+        payload.get("outcome") == SYNTHESIZE_DRAFT_PENDING_REVIEW
+    ), (
+        f"pending-review re-invocation must keep outcome="
+        f"{SYNTHESIZE_DRAFT_PENDING_REVIEW!r}; got "
+        f"{payload.get('outcome')!r}"
+    )
+    assert payload.get("sentinel") == BOOTSTRAP_PENDING_REVIEW_FIELD, (
+        f"pending-review payload must keep the "
+        f"BOOTSTRAP_PENDING_REVIEW sentinel; got "
+        f"{payload.get('sentinel')!r}"
+    )
+    # Pin the "indistinguishable" contract: the create-success
+    # and resume short-circuit payloads are field-by-field equal
+    # (modulo volatile ``created_at``).
+    assert_payloads_equal_modulo_volatile(create_payload, payload)
