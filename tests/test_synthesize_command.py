@@ -1671,3 +1671,391 @@ def test_synthesize_keeps_pending_review_without_optimizer_call(
     # and resume short-circuit payloads are field-by-field equal
     # (modulo volatile ``created_at``).
     assert_payloads_equal_modulo_volatile(create_payload, payload)
+
+
+# --------------------------------------------------------------------------- #
+# Cross-task integration gap (F4 global review)                               #
+# --------------------------------------------------------------------------- #
+#
+# The Task 1 parser accepts three F3 confirmation flags
+# (``--allow-routing-revision``, ``--allow-dirty-unrelated``,
+# ``--confirm-resume``) and advertises them as "aligned with
+# optimize", but the Task 3 resume path silently dropped them
+# before the optimizer pipeline call. The integration repair
+# threads the three flags through
+# :func:`metacrucible.synthesize.run_synthesis_optimizer` and
+# forwards them into :func:`run_optimizer_pipeline`, mirroring
+# :func:`metacrucible.__main__.cmd_optimize`. These two tests
+# pin the end-to-end wiring by patching the underlying
+# :func:`metacrucible.optimizer.run_optimizer_pipeline`
+# reference (NOT the wrapper) and asserting the call sequence
+# + kwargs from the parser down to the pipeline.
+
+
+def test_synthesize_allow_routing_revision_escalates_preview_to_mutate(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--allow-routing-revision`` must escalate the synthesize
+    resume path from a PREVIEW pipeline call to a mutating
+    pipeline call (``human_confirmed=True``), mirroring
+    :func:`metacrucible.__main__.cmd_optimize`'s preview /
+    apply cutover.
+
+    The test monkeypatches the underlying
+    :func:`metacrucible.optimizer.run_optimizer_pipeline`
+    reference (NOT :func:`run_synthesis_optimizer`) so the
+    wrapper's preview / apply logic is exercised end-to-end
+    against a deterministic fake. The fake returns a
+    ``status="PREVIEW"`` result on the first call (simulating
+    a routing-revision proposal) and a
+    ``status="ACCEPTED"`` result on the second call (simulating
+    the mutating pass after operator approval). The block in
+    :func:`run_synthesis_optimizer` triggers the second call
+    only when ``allow_routing_revision=True`` is forwarded.
+
+    Pinned:
+      - exactly 2 ``run_optimizer_pipeline`` calls,
+      - first call: ``human_confirmed=False``,
+        ``routing_confirmation_preview=True`` (preview pass),
+      - second call: ``human_confirmed=True``,
+        ``routing_confirmation_preview=False`` (mutating
+        pass after explicit operator approval),
+      - payload ``status='OK'`` and ``outcome='accepted'``
+        (the mutating pass returned ACCEPTED).
+    """
+    from dataclasses import dataclass
+    from metacrucible import synthesize as synth_mod
+    from metacrucible import __main__ as cli_main
+
+    @dataclass
+    class _PreviewStubResult:
+        status: str = "PREVIEW"
+        run_id: str = "stub-preview"
+        rounds: int = 0
+        record_counts: dict[str, int] = None  # type: ignore[assignment]
+        evidence_refs: dict[str, str] = None  # type: ignore[assignment]
+        blockers: list = None  # type: ignore[assignment]
+        warnings: list = None  # type: ignore[assignment]
+        best_revision: dict | None = None
+        acceptance_decision: dict = None  # type: ignore[assignment]
+        selected_candidate_ids: list = None  # type: ignore[assignment]
+        stop_reason: str = "routing_confirmation_preview"
+        preview: dict | None = None
+
+    @dataclass
+    class _AcceptedStubResult:
+        status: str = "ACCEPTED"
+        run_id: str = "stub-accepted"
+        rounds: int = 1
+        record_counts: dict[str, int] = None  # type: ignore[assignment]
+        evidence_refs: dict[str, str] = None  # type: ignore[assignment]
+        blockers: list = None  # type: ignore[assignment]
+        warnings: list = None  # type: ignore[assignment]
+        best_revision: dict | None = None
+        acceptance_decision: dict = None  # type: ignore[assignment]
+        selected_candidate_ids: list = None  # type: ignore[assignment]
+        stop_reason: str = "accepted"
+        preview: dict | None = None
+
+    workspace = _reviewed_synthesis_workspace(
+        tmp_path, monkeypatch=monkeypatch, capsys=capsys
+    )
+    # Drain the bootstrap call's emit so the test's own
+    # ``captured.out`` carries only the resume call.
+    capsys.readouterr()
+
+    call_log: list[dict[str, object]] = []
+
+    def _stub_run_optimizer_pipeline(**kwargs: object) -> object:
+        call_log.append(dict(kwargs))
+        if len(call_log) == 1:
+            # Preview pass: simulate a routing revision proposal
+            # so the wrapper's preview / apply cutover fires.
+            return _PreviewStubResult(
+                record_counts={},
+                evidence_refs={
+                    "receipt": "/tmp/evidence/stub-preview/receipt.json"
+                },
+                blockers=[],
+                warnings=[],
+                best_revision=None,
+                acceptance_decision={},
+                selected_candidate_ids=[],
+                preview={
+                    "routing_confirmation": [
+                        {
+                            "suggestion_id": "sug-1",
+                            "routing_field": "model",
+                            "old": "haiku",
+                            "new": "sonnet",
+                        }
+                    ],
+                    "profile_verdict": {"blockers": []},
+                },
+            )
+        # Mutating pass: simulate ACCEPTED so the resume path
+        # exits with the accepted outcome + EXIT_OK.
+        return _AcceptedStubResult(
+            record_counts={"case_eval": 1, "case_held_out": 1},
+            evidence_refs={
+                "receipt": "/tmp/evidence/stub-accepted/receipt.json"
+            },
+            blockers=[],
+            warnings=[],
+            best_revision=None,
+            acceptance_decision={
+                "accepted": True,
+                "reason": "accepted",
+            },
+            selected_candidate_ids=["cand-1"],
+        )
+
+    monkeypatch.setattr(
+        synth_mod,
+        "run_optimizer_pipeline",
+        _stub_run_optimizer_pipeline,
+    )
+    # The Task 4 BLOCKED bundle write would touch the
+    # user-global storage; the escalate path does not trigger
+    # it (the mutating pass returns ACCEPTED), but pin the
+    # guard so a future test cannot regress to a real write.
+    monkeypatch.setattr(
+        synth_mod, "_write_synthesize_blocked_bundle", lambda _: {}
+    )
+
+    ns = argparse.Namespace(
+        command="synthesize",
+        capability_need=None,
+        from_spec=None,
+        output=str(workspace),
+        max_rounds=ROUND_BUDGET_DEFAULT,
+        json=True,
+        allow_routing_revision=True,
+        allow_dirty_unrelated=False,
+        confirm_resume=False,
+    )
+    rc = cli_main.cmd_synthesize(ns)
+    captured = capsys.readouterr()
+
+    assert rc == EXIT_OK, (
+        f"synthesize with --allow-routing-revision must return "
+        f"EXIT_OK when the mutating pass accepts; got rc={rc} "
+        f"stdout={captured.out!r} stderr={captured.err!r}"
+    )
+    assert len(call_log) == 2, (
+        f"--allow-routing-revision must escalate the resume "
+        f"path from 1 preview call to 2 (preview + mutate); "
+        f"got {len(call_log)} call(s); calls={call_log!r}"
+    )
+    # First call: preview pass.
+    first = call_log[0]
+    assert first.get("human_confirmed") is False, (
+        f"preview pass must pass human_confirmed=False; "
+        f"got {first.get('human_confirmed')!r}"
+    )
+    assert first.get("routing_confirmation_preview") is True, (
+        f"preview pass must pass "
+        f"routing_confirmation_preview=True; "
+        f"got {first.get('routing_confirmation_preview')!r}"
+    )
+    assert first.get("max_rounds") == ROUND_BUDGET_DEFAULT, (
+        f"preview pass must forward max_rounds from the "
+        f"dispatcher ({ROUND_BUDGET_DEFAULT}); got "
+        f"{first.get('max_rounds')!r}"
+    )
+    # Second call: mutating pass.
+    second = call_log[1]
+    assert second.get("human_confirmed") is True, (
+        f"mutating pass must pass human_confirmed=True when "
+        f"--allow-routing-revision is set; got "
+        f"{second.get('human_confirmed')!r}"
+    )
+    assert second.get("routing_confirmation_preview") is False, (
+        f"mutating pass must pass "
+        f"routing_confirmation_preview=False; got "
+        f"{second.get('routing_confirmation_preview')!r}"
+    )
+    assert second.get("max_rounds") == ROUND_BUDGET_DEFAULT, (
+        f"mutating pass must forward max_rounds from the "
+        f"dispatcher ({ROUND_BUDGET_DEFAULT}); got "
+        f"{second.get('max_rounds')!r}"
+    )
+    payload = json.loads(captured.out)
+    assert payload.get("status") == "OK", (
+        f"payload status must be 'OK' when mutating pass "
+        f"accepts; got {payload.get('status')!r}"
+    )
+    assert payload.get("outcome") == "accepted", (
+        f"payload outcome must be 'accepted' when mutating "
+        f"pass accepts; got {payload.get('outcome')!r}"
+    )
+    # The threaded flag MUST land on the BLOCKED payload shape
+    # even on the accepted path (mirror cmd_optimize).
+    assert payload.get("allow_dirty_unrelated") is False, (
+        f"payload must carry allow_dirty_unrelated=False on "
+        f"accepted resume; got "
+        f"{payload.get('allow_dirty_unrelated')!r}"
+    )
+    assert payload.get("confirm_resume") is False, (
+        f"payload must carry confirm_resume=False on accepted "
+        f"resume; got {payload.get('confirm_resume')!r}"
+    )
+
+
+def test_synthesize_without_allow_routing_revision_blocks_on_preview(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without ``--allow-routing-revision`` the synthesize
+    resume path runs ONE preview pass and BLOCKED on the
+    PREVIEW result (the wrapper does NOT escalate to a
+    mutating pass). Mirrors the
+    :func:`metacrucible.__main__.cmd_optimize` preview /
+    apply cutover.
+
+    The test also pins that the threaded
+    ``--allow-dirty-unrelated`` and ``--confirm-resume``
+    flags reach the BLOCKED payload (mirror cmd_optimize
+    BLOCKED payload shape) so downstream consumers can see
+    the dispatcher-level flag values on the synthesize-side
+    BLOCKED records.
+
+    Pinned:
+      - exactly 1 ``run_optimizer_pipeline`` call,
+      - that call: ``human_confirmed=False``,
+        ``routing_confirmation_preview=True``,
+      - payload ``status='BLOCKED'`` and
+        ``outcome='aborted'`` (PREVIEW is not ACCEPTED),
+      - payload carries ``allow_dirty_unrelated=True`` and
+        ``confirm_resume=True`` (the operator-supplied
+        threaded flag values).
+    """
+    from dataclasses import dataclass
+    from metacrucible import synthesize as synth_mod
+    from metacrucible import __main__ as cli_main
+
+    @dataclass
+    class _PreviewStubResult:
+        status: str = "PREVIEW"
+        run_id: str = "stub-preview"
+        rounds: int = 0
+        record_counts: dict[str, int] = None  # type: ignore[assignment]
+        evidence_refs: dict[str, str] = None  # type: ignore[assignment]
+        blockers: list = None  # type: ignore[assignment]
+        warnings: list = None  # type: ignore[assignment]
+        best_revision: dict | None = None
+        acceptance_decision: dict = None  # type: ignore[assignment]
+        selected_candidate_ids: list = None  # type: ignore[assignment]
+        stop_reason: str = "routing_confirmation_preview"
+        preview: dict | None = None
+
+    workspace = _reviewed_synthesis_workspace(
+        tmp_path, monkeypatch=monkeypatch, capsys=capsys
+    )
+    capsys.readouterr()
+
+    call_log: list[dict[str, object]] = []
+
+    def _stub_run_optimizer_pipeline(**kwargs: object) -> object:
+        call_log.append(dict(kwargs))
+        return _PreviewStubResult(
+            record_counts={},
+            evidence_refs={
+                "receipt": "/tmp/evidence/stub-preview/receipt.json"
+            },
+            blockers=[
+                {
+                    "id": "routing-revision-confirmation-required",
+                    "message": "test routing revision requires confirmation",
+                }
+            ],
+            warnings=[],
+            best_revision=None,
+            acceptance_decision={},
+            selected_candidate_ids=[],
+            preview={
+                "routing_confirmation": [
+                    {
+                        "suggestion_id": "sug-1",
+                        "routing_field": "model",
+                        "old": "haiku",
+                        "new": "sonnet",
+                    }
+                ],
+                "profile_verdict": {"blockers": []},
+            },
+        )
+
+    monkeypatch.setattr(
+        synth_mod,
+        "run_optimizer_pipeline",
+        _stub_run_optimizer_pipeline,
+    )
+    # The Task 4 BLOCKED bundle write would touch the
+    # user-global storage; the BLOCKED resume path triggers
+    # it. Stub it out so the test does not need to wire a
+    # fake HOME.
+    monkeypatch.setattr(
+        synth_mod, "_write_synthesize_blocked_bundle", lambda _: {}
+    )
+
+    ns = argparse.Namespace(
+        command="synthesize",
+        capability_need=None,
+        from_spec=None,
+        output=str(workspace),
+        max_rounds=ROUND_BUDGET_DEFAULT,
+        json=True,
+        allow_routing_revision=False,
+        allow_dirty_unrelated=True,
+        confirm_resume=True,
+    )
+    rc = cli_main.cmd_synthesize(ns)
+    captured = capsys.readouterr()
+
+    assert rc == EXIT_BLOCKED, (
+        f"synthesize without --allow-routing-revision must "
+        f"return EXIT_BLOCKED on PREVIEW; got rc={rc} "
+        f"stdout={captured.out!r} stderr={captured.err!r}"
+    )
+    assert len(call_log) == 1, (
+        f"without --allow-routing-revision the resume path "
+        f"must call run_optimizer_pipeline exactly once; "
+        f"got {len(call_log)} call(s); calls={call_log!r}"
+    )
+    only = call_log[0]
+    assert only.get("human_confirmed") is False, (
+        f"preview-only call must pass human_confirmed=False; "
+        f"got {only.get('human_confirmed')!r}"
+    )
+    assert only.get("routing_confirmation_preview") is True, (
+        f"preview-only call must pass "
+        f"routing_confirmation_preview=True; got "
+        f"{only.get('routing_confirmation_preview')!r}"
+    )
+    payload = json.loads(captured.out)
+    assert payload.get("status") == "BLOCKED", (
+        f"payload status must be 'BLOCKED' on PREVIEW without "
+        f"--allow-routing-revision; got {payload.get('status')!r}"
+    )
+    assert payload.get("outcome") == "aborted", (
+        f"payload outcome must be 'aborted' on PREVIEW without "
+        f"--allow-routing-revision; got {payload.get('outcome')!r}"
+    )
+    # Pin the BLOCKED payload shape: the threaded
+    # ``--allow-dirty-unrelated`` and ``--confirm-resume``
+    # flags MUST reach the BLOCKED payload (mirror cmd_optimize
+    # BLOCKED payload shape).
+    assert payload.get("allow_dirty_unrelated") is True, (
+        f"BLOCKED payload must carry allow_dirty_unrelated=True "
+        f"when --allow-dirty-unrelated is set; got "
+        f"{payload.get('allow_dirty_unrelated')!r}"
+    )
+    assert payload.get("confirm_resume") is True, (
+        f"BLOCKED payload must carry confirm_resume=True "
+        f"when --confirm-resume is set; got "
+        f"{payload.get('confirm_resume')!r}"
+    )

@@ -900,6 +900,9 @@ def run_synthesis_optimizer(
     benchmark_path: Path,
     artifact_path: Path,
     max_rounds: int = _ROUND_BUDGET_DEFAULT,
+    allow_routing_revision: bool = False,
+    allow_dirty_unrelated: bool = False,
+    confirm_resume: bool = False,
 ) -> Any:
     """Invoke the F3 optimizer pipeline from the synthesize resume path.
 
@@ -926,8 +929,35 @@ def run_synthesis_optimizer(
     The ``max_rounds`` budget is forwarded verbatim from
     the dispatcher's ``--max-rounds`` flag (the F3 default
     is one round for the minimal safe MVP).
+
+    The three F3 confirmation flags are threaded through
+    the synthesize resume path so the CLI does not silently
+    drop them after the parser-level dest flip:
+
+      - ``allow_routing_revision``: when the preview pass
+        returns ``status == "PREVIEW"`` (the pipeline
+        surfaced at least one unconfirmed routing
+        suggestion), the wrapper escalates to a mutating
+        pass with ``human_confirmed=True`` only when this
+        flag is ``True``. Without the flag the preview
+        result stands and the BLOCKED verdict downstream
+        carries the routing-revision blocker. Mirrors
+        :func:`metacrucible.__main__.cmd_optimize`'s
+        preview / apply cutover. The synthesize path is
+        non-interactive (no TTY prompt), so the explicit
+        CLI flag is the only escalation path.
+      - ``allow_dirty_unrelated`` /
+        ``confirm_resume``: forwarded verbatim so the
+        caller (:func:`_synthesize_resume_branch`) can
+        reflect them on the BLOCKED payload alongside
+        :func:`cmd_optimize`'s shape; the synthesize
+        resume path does not currently own a gate for
+        either, but the kwargs are now part of the
+        signature so the parser-level dest-flipping is
+        observable end-to-end instead of silently
+        dropped before the optimizer call.
     """
-    return run_optimizer_pipeline(
+    preview_result = run_optimizer_pipeline(
         workspace=Path(workspace),
         benchmark_path=Path(benchmark_path),
         artifact_path=Path(artifact_path),
@@ -936,6 +966,20 @@ def run_synthesis_optimizer(
         human_confirmed=False,
         routing_confirmation_preview=True,
     )
+    if (
+        preview_result.status == "PREVIEW"
+        and allow_routing_revision
+    ):
+        return run_optimizer_pipeline(
+            workspace=Path(workspace),
+            benchmark_path=Path(benchmark_path),
+            artifact_path=Path(artifact_path),
+            call_fn=None,
+            max_rounds=max_rounds,
+            human_confirmed=True,
+            routing_confirmation_preview=False,
+        )
+    return preview_result
 
 
 def _emit_pending_review_payload(
@@ -1094,11 +1138,34 @@ def _synthesize_resume_branch(
     )
     if max_rounds < 1:
         max_rounds = 1
+    # The three F3 confirmation flags are threaded through the
+    # synthesize resume path so the parser-level dest-flipping
+    # is observable end-to-end instead of silently dropped
+    # before the optimizer call (cross-task integration gap
+    # surfaced by the F4 global review). ``allow_routing_revision``
+    # controls the preview / apply cutover in
+    # :func:`run_synthesis_optimizer`; ``allow_dirty_unrelated``
+    # is reflected on the BLOCKED payload to mirror
+    # :func:`metacrucible.__main__.cmd_optimize`; ``confirm_resume``
+    # is recorded for symmetry even though the synthesize path
+    # does not currently own an interrupted-run gate.
+    allow_routing_revision = bool(
+        getattr(args, "allow_routing_revision", False)
+    )
+    allow_dirty_unrelated = bool(
+        getattr(args, "allow_dirty_unrelated", False)
+    )
+    confirm_resume = bool(
+        getattr(args, "confirm_resume", False)
+    )
     pipeline_result = run_synthesis_optimizer(
         workspace=workspace_path,
         benchmark_path=benchmark_path,
         artifact_path=artifact_path_value,
         max_rounds=max_rounds,
+        allow_routing_revision=allow_routing_revision,
+        allow_dirty_unrelated=allow_dirty_unrelated,
+        confirm_resume=confirm_resume,
     )
     pipeline_status = str(getattr(pipeline_result, "status", ""))
     acceptance_decision = getattr(
@@ -1151,6 +1218,15 @@ def _synthesize_resume_branch(
         "stop_reason": str(
             getattr(pipeline_result, "stop_reason", "")
         ),
+        # Mirror :func:`metacrucible.__main__.cmd_optimize`'s
+        # BLOCKED payload shape so downstream consumers see the
+        # same ``allow_dirty_unrelated`` field on the
+        # synthesize-side BLOCKED records; ``confirm_resume`` is
+        # recorded for symmetry so the dispatcher-level flag
+        # reach is observable end-to-end (Issue #41 F4 global
+        # review cross-task integration gap).
+        "allow_dirty_unrelated": allow_dirty_unrelated,
+        "confirm_resume": confirm_resume,
     }
     if blocked_bundle_refs:
         payload["evidence_refs"].update(blocked_bundle_refs)
