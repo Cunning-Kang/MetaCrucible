@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import datetime as _dt
 import re
+import sys
 from pathlib import Path
 from typing import Any, Callable
 
@@ -31,13 +33,30 @@ from .benchmark import (
     STATUS_GENERATED,
     load_benchmark,
 )
+from .blocked_bundles import write_blocked_bundle
 from .exit_codes import EXIT_BLOCKED, EXIT_OK
 from .promote import _atomic_write_jsonl
 from .optimizer import ROUND_BUDGET_DEFAULT as _ROUND_BUDGET_DEFAULT, run_optimizer_pipeline
 from .storage import (
     RepositoryStorage,
+    UserGlobalStorage,
     compute_benchmark_digest,
 )
+
+def _now_iso() -> str:
+    """Return the current UTC instant as an ISO-8601 string.
+
+    Mirror of :func:`metacrucible.__main__._now_iso` in form
+    only -- the synthesize module is a leaf that does not
+    import from :mod:`metacrucible.__main__` (that would
+    create a circular import when invoked via
+    ``python -m metacrucible``), so the helper is re-stated
+    here. Tests freeze the clock by
+    ``monkeypatch.setattr(synth_mod, "_now_iso", lambda: FROZEN)``
+    to make the run_id byte-stable.
+    """
+    return _dt.datetime.now(_dt.timezone.utc).isoformat()
+
 
 #: Benchmark file name (ADR 0029). Re-stated locally so this module
 #: is a leaf that does not import from :mod:`metacrucible.__main__`
@@ -605,6 +624,88 @@ SYNTHESIS_HISTORY_OPTIMIZER_STARTED = "synthesis_optimizer_started"
 #: the run timeline with run_id correlation.
 SYNTHESIS_HISTORY_FINISHED = "synthesis_finished"
 
+# --------------------------------------------------------------------------- #
+# Task 4 (Issue #41 / PRD F4) - synthesize evaluation-stage BLOCKED bundle   #
+# --------------------------------------------------------------------------- #
+
+#: Run-type value written into the BLOCKED evidence bundle by
+#: :func:`_write_synthesize_blocked_bundle`. Matches the ADR 0035
+#: ``synthesize_evaluation_stage`` slot in
+#: :data:`metacrucible.blocked_bundles.REQUIRES_BLOCKED_BUNDLE_CATEGORIES`
+#: so the matrix routes the BLOCKED bundle write through
+#: :func:`metacrucible.blocked_bundles.write_blocked_bundle`.
+SYNTHESIZE_EVALUATION_BLOCKED_BUNDLE_RUN_TYPE = "synthesize_evaluation_stage"
+
+#: Run-id prefix used when emitting the synthesize-evaluation-stage
+#: BLOCKED evidence bundle. Mirrors the ``optimize`` / ``evaluate``
+#: / ``baseline-create`` prefixes; downstream tooling can branch on
+#: the prefix to distinguish synthesize-evaluation-stage bundles
+#: from other BLOCKED categories.
+SYNTHESIZE_BLOCKED_BUNDLE_RUN_ID_PREFIX = "synthesize"
+
+
+def _write_synthesize_blocked_bundle(
+    blockers: list[dict[str, object]],
+) -> dict[str, str]:
+    """Emit the ADR 0035 synthesize-evaluation-stage BLOCKED bundle.
+
+    Best-effort: a write failure is logged to stderr and the
+    function returns an empty ``dict`` so the caller
+    (:func:`_synthesize_resume_branch`) still returns
+    :data:`EXIT_BLOCKED`. The BLOCKED bundle is the *evidence*
+    of the BLOCKED verdict, not the source of truth; the
+    in-memory payload wins.
+
+    Mirrors :func:`metacrucible.__main__._write_optimize_blocked_bundle`
+    so the four BLOCKED-emitting commands share a single,
+    predictable write contract.
+
+    Parameters
+    ----------
+    blockers:
+        Sequence of ``{id, message}`` mappings. Forwarded
+        verbatim to :func:`metacrucible.blocked_bundles.write_blocked_bundle`
+        which normalises them through the v1 contract.
+
+    Returns
+    -------
+    A mapping of evidence-ref keys (``blocked_receipt``,
+    ``blocked_summary``, ``blocked_trajectory_digest``) to
+    the bundle's sibling-relative filenames, or an empty
+    ``dict`` when the bundle write failed. The keys are
+    namespaced with ``blocked_`` so they cannot collide with
+    the optimizer's own ``evidence_refs`` keys when the
+    caller merges the two mappings into the payload's
+    ``evidence_refs`` field.
+    """
+    refs: dict[str, str] = {}
+    try:
+        global_store = UserGlobalStorage()
+        run_id = (
+            f"{SYNTHESIZE_BLOCKED_BUNDLE_RUN_ID_PREFIX}-"
+            f"{_now_iso().replace(':', '').replace('-', '')}"
+        )
+        bundle_dir = write_blocked_bundle(
+            global_store,
+            run_id=run_id,
+            run_type=SYNTHESIZE_EVALUATION_BLOCKED_BUNDLE_RUN_TYPE,
+            blockers=blockers,
+        )
+        bundle_name = bundle_dir.name
+        refs = {
+            "blocked_receipt": f"{bundle_name}/receipt.json",
+            "blocked_summary": f"{bundle_name}/summary.json",
+            "blocked_trajectory_digest": (
+                f"{bundle_name}/trajectory-digest.json"
+            ),
+        }
+    except Exception as exc:  # noqa: BLE001
+        print(
+            "metacrucible: failed to write synthesize BLOCKED "
+            "bundle: " + type(exc).__name__ + ": " + str(exc),
+            file=sys.stderr,
+        )
+    return refs
 
 
 def load_synthesis_workspace(output: Path) -> dict[str, object]:
@@ -1004,14 +1105,29 @@ def _synthesize_resume_branch(
         pipeline_result, "acceptance_decision", {}
     ) or {}
     accepted_flag = bool(acceptance_decision.get("accepted") is True)
+    optimizer_blockers: list[dict[str, object]] = list(
+        getattr(pipeline_result, "blockers", []) or []
+    )
     if pipeline_status == "ACCEPTED" and accepted_flag:
         outcome = SYNTHESIZE_ACCEPTED
         status = "OK"
         exit_code = EXIT_OK
+        blocked_bundle_refs: dict[str, str] = {}
     else:
         outcome = SYNTHESIZE_ABORTED
         status = "BLOCKED"
         exit_code = EXIT_BLOCKED
+        # Task 4: write the ADR 0035 minimal BLOCKED evidence
+        # bundle for the synthesize evaluation stage. Called
+        # ONLY for evaluation-stage aborted/BLOCKED outcomes
+        # after the optimizer stage has been reached (this
+        # branch). Input validation, missing spec, empty spec,
+        # ordinary pending-review draft creation, and
+        # pre-optimizer benchmark blockers do NOT call the
+        # bundle writer (per the Task 4 hard requirement).
+        blocked_bundle_refs = _write_synthesize_blocked_bundle(
+            optimizer_blockers,
+        )
     payload = {
         "status": status,
         "outcome": outcome,
@@ -1026,7 +1142,7 @@ def _synthesize_resume_branch(
         "evidence_refs": dict(
             getattr(pipeline_result, "evidence_refs", {}) or {}
         ),
-        "blockers": list(getattr(pipeline_result, "blockers", []) or []),
+        "blockers": optimizer_blockers,
         "warnings": list(getattr(pipeline_result, "warnings", []) or []),
         "acceptance_decision": dict(acceptance_decision),
         "selected_candidate_ids": list(
@@ -1036,6 +1152,8 @@ def _synthesize_resume_branch(
             getattr(pipeline_result, "stop_reason", "")
         ),
     }
+    if blocked_bundle_refs:
+        payload["evidence_refs"].update(blocked_bundle_refs)
     storage.append_history(
         {
             "event": SYNTHESIS_HISTORY_FINISHED,

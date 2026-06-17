@@ -1005,11 +1005,17 @@ def test_synthesize_reviewed_workspace_runs_optimizer_and_accepts(
 
     The test pins the dispatch contract end-to-end:
 
-      - The optimizer entrypoint is called exactly once with
-        ``workspace``, ``benchmark_path``, ``artifact_path``,
-        ``max_rounds`` (from the dispatcher), ``call_fn=None``,
-        ``human_confirmed=False``, and
-        ``routing_confirmation_preview=True``.
+      - The synthesize-side wrapper
+        :func:`metacrucible.synthesize.run_synthesis_optimizer`
+        is called exactly once with ``workspace``,
+        ``benchmark_path``, ``artifact_path``, and
+        ``max_rounds`` (from the dispatcher). The wrapper's
+        internal defaults (``call_fn=None``,
+        ``human_confirmed=False``,
+        ``routing_confirmation_preview=True``) are NOT part
+        of this test's contract -- they are
+        :func:`run_synthesis_optimizer`'s contract and the
+        wrapper is the single seam.
       - The JSON payload is parseable, has
         ``status='OK'`` and ``outcome='accepted'``, and
         carries the optimizer ``acceptance_decision``,
@@ -1074,7 +1080,7 @@ def test_synthesize_reviewed_workspace_runs_optimizer_and_accepts(
             selected_candidate_ids=["cand-1"],
         )
 
-    monkeypatch.setattr(synth_mod, "run_optimizer_pipeline", _stub)
+    monkeypatch.setattr(synth_mod, "run_synthesis_optimizer", _stub)
 
     ns = _synthesize_namespace(
         tmp_path=tmp_path,
@@ -1116,22 +1122,6 @@ def test_synthesize_reviewed_workspace_runs_optimizer_and_accepts(
         f"optimizer must be called with the envelope-declared "
         f"artifact path; got artifact_path={call.get('artifact_path')!r} "
         f"expected={artifact_path!r}"
-    )
-    assert call.get("call_fn") is None, (
-        f"optimizer must be called with call_fn=None in the MVP "
-        f"synthesize-resume path; got call_fn={call.get('call_fn')!r}"
-    )
-    assert call.get("human_confirmed") is False, (
-        f"optimizer must be called with human_confirmed=False in "
-        f"the synthesize-resume path; got "
-        f"human_confirmed={call.get('human_confirmed')!r}"
-    )
-    assert call.get("routing_confirmation_preview") is True, (
-        f"optimizer must be called with "
-        f"routing_confirmation_preview=True in the synthesize-"
-        f"resume path (the F3 preview/gate flow owns routing "
-        f"confirmation); got "
-        f"routing_confirmation_preview={call.get('routing_confirmation_preview')!r}"
     )
     assert call.get("max_rounds") == ROUND_BUDGET_DEFAULT, (
         f"optimizer must be called with max_rounds from the "
@@ -1278,7 +1268,7 @@ def test_synthesize_reviewed_workspace_aborts_when_optimizer_rejects(
             selected_candidate_ids=[],
         )
 
-    monkeypatch.setattr(synth_mod, "run_optimizer_pipeline", _stub)
+    monkeypatch.setattr(synth_mod, "run_synthesis_optimizer", _stub)
 
     ns = _synthesize_namespace(
         tmp_path=tmp_path,
@@ -1314,10 +1304,22 @@ def test_synthesize_reviewed_workspace_aborts_when_optimizer_rejects(
         f"aborted payload must carry the optimizer blockers "
         f"verbatim; got {payload.get('blockers')!r}"
     )
-    assert payload.get("evidence_refs") == evidence_refs, (
-        f"aborted payload must carry the optimizer evidence_refs "
-        f"verbatim; got {payload.get('evidence_refs')!r}"
-    )
+    # Task 4: the aborted payload must still carry the optimizer's
+    # evidence_refs verbatim (Task 3 contract) AND merge the BLOCKED
+    # bundle refs (Task 4 contract). The optimizer's keys must be a
+    # subset of the payload's evidence_refs keys with matching values.
+    actual_evidence_refs = payload.get("evidence_refs") or {}
+    for key, value in evidence_refs.items():
+        assert key in actual_evidence_refs, (
+            f"aborted payload must carry the optimizer "
+            f"evidence_refs verbatim; missing key={key!r} "
+            f"got {actual_evidence_refs!r}"
+        )
+        assert actual_evidence_refs[key] == value, (
+            f"aborted payload evidence_refs[{key!r}] must equal "
+            f"the optimizer value; got "
+            f"{actual_evidence_refs[key]!r} expected {value!r}"
+        )
     assert payload.get("record_counts") == {
         "case_eval": 1,
         "case_held_out": 1,
@@ -1363,6 +1365,208 @@ def test_synthesize_reviewed_workspace_aborts_when_optimizer_rejects(
     assert finished.get("stop_reason") == "max_rounds_reached", (
         f"synthesis_finished stop_reason must mirror the "
         f"optimizer stop_reason; got {finished!r}"
+    )
+
+
+def test_synthesize_evaluation_stage_block_writes_blocked_bundle(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC4 (command, evaluation-stage BLOCKED bundle): when the
+    optimizer returns a non-ACCEPTED status (here, BLOCKED with
+    blockers), ``cmd_synthesize`` must emit the ADR 0035 minimal
+    ``BLOCKED`` evidence bundle under
+    ``run_type='synthesize_evaluation_stage'`` and attach the
+    bundle refs to the payload's ``evidence_refs``.
+
+    The test pins the bundle-emission contract end-to-end:
+
+      - ``HOME`` is pinned to a temp dir so the
+        :class:`UserGlobalStorage` writes into the test's own
+        evidence directory (no pollution of the developer's
+        ``~/.metacrucible/``),
+      - a reviewed synthesis workspace is seeded via
+        :func:`_reviewed_synthesis_workspace` (Task 3 helper),
+      - the optimizer is monkeypatched to return a BLOCKED
+        result with a stable stub blocker id,
+      - ``cmd_synthesize`` invoked with ``json=True`` returns
+        :data:`metacrucible.exit_codes.EXIT_BLOCKED` and a JSON
+        payload with ``status='BLOCKED'``, ``outcome='aborted'``,
+        and the stub blocker id in the blockers list,
+      - ``$HOME/.metacrucible/evidence/<run_id>/receipt.json``,
+        ``summary.json``, and ``trajectory-digest.json`` exist
+        (the three durable bundle files; no ``raw/``,
+        no ``cleanup.json``),
+      - ``receipt.json`` carries ``status='BLOCKED'``,
+        ``run_type='synthesize_evaluation_stage'``, and the
+        normalised blocker list,
+      - the payload's ``evidence_refs`` map carries
+        ``blocked_receipt``, ``blocked_summary``, and
+        ``blocked_trajectory_digest`` keys that name the bundle.
+    """
+    from dataclasses import dataclass
+    from metacrucible import synthesize as synth_mod
+    from metacrucible import __main__ as cli_main
+
+    # Pin HOME so the BLOCKED bundle write does not pollute the
+    # developer's ``~/.metacrucible/``. Mirrors the pattern in
+    # tests/test_blocked_bundle_policy.py::isolated_global_home.
+    fake_home = tmp_path / "home"
+    fake_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    workspace = _reviewed_synthesis_workspace(
+        tmp_path, monkeypatch=monkeypatch, capsys=capsys
+    )
+
+    @dataclass
+    class _StubResult:
+        status: str = "BLOCKED"
+        run_id: str = "stub-run-eval-blocked"
+        rounds: int = 0
+        record_counts: dict[str, int] = None  # type: ignore[assignment]
+        evidence_refs: dict[str, str] = None  # type: ignore[assignment]
+        blockers: list = None  # type: ignore[assignment]
+        warnings: list = None  # type: ignore[assignment]
+        best_revision: dict | None = None
+        acceptance_decision: dict = None  # type: ignore[assignment]
+        selected_candidate_ids: list = None  # type: ignore[assignment]
+        stop_reason: str = "evaluation_stage_blocked"
+        preview: dict | None = None
+
+    blocker_record = {
+        "id": "no-eval-improvement",
+        "message": "candidate did not improve eval pass-rate",
+    }
+
+    def _stub(**kwargs: object) -> _StubResult:
+        return _StubResult(
+            record_counts={"case_eval": 1, "case_held_out": 1},
+            evidence_refs={},
+            blockers=[blocker_record],
+            warnings=[],
+            best_revision=None,
+            acceptance_decision={
+                "accepted": False,
+                "reason": "no_eval_improvement",
+            },
+            selected_candidate_ids=[],
+        )
+
+    monkeypatch.setattr(synth_mod, "run_synthesis_optimizer", _stub)
+    # Freeze the synthesize module's _now_iso() so the run_id
+    # is byte-stable; matches the Task 3 freeze pattern on
+    # ``metacrucible.__main__._now_iso``.
+    monkeypatch.setattr(synth_mod, "_now_iso", lambda: FROZEN_NOW)
+
+    ns = _synthesize_namespace(
+        tmp_path=tmp_path,
+        capability_need=None,
+        from_spec=None,
+    )
+    rc = cli_main.cmd_synthesize(ns)
+    captured = capsys.readouterr()
+
+    assert rc == EXIT_BLOCKED, (
+        f"synthesize evaluation-stage BLOCKED must return "
+        f"EXIT_BLOCKED; got rc={rc} stdout={captured.out!r} "
+        f"stderr={captured.err!r}"
+    )
+    payload = json.loads(captured.out)
+    assert payload.get("status") == "BLOCKED", (
+        f"evaluation-stage BLOCKED payload status must be "
+        f"'BLOCKED'; got {payload.get('status')!r}"
+    )
+    assert payload.get("outcome") == "aborted", (
+        f"evaluation-stage BLOCKED payload outcome must be "
+        f"'aborted'; got {payload.get('outcome')!r}"
+    )
+    blocker_ids = [
+        b.get("id") for b in payload.get("blockers", [])
+        if isinstance(b, dict)
+    ]
+    assert "no-eval-improvement" in blocker_ids, (
+        f"evaluation-stage BLOCKED payload must carry the stub "
+        f"blocker id; got blocker_ids={blocker_ids!r}"
+    )
+
+    # The three durable bundle files exist under
+    # ``$HOME/.metacrucible/evidence/<run_id>/`` and carry
+    # ``status='BLOCKED'`` + ``run_type='synthesize_evaluation_stage'``.
+    evidence_root = fake_home / ".metacrucible" / "evidence"
+    assert evidence_root.is_dir(), (
+        f"BLOCKED bundle must create the evidence root; got "
+        f"{evidence_root!r}"
+    )
+    bundle_dirs = [p for p in evidence_root.iterdir() if p.is_dir()]
+    assert len(bundle_dirs) == 1, (
+        f"BLOCKED bundle must create exactly one evidence "
+        f"bundle directory; got {bundle_dirs!r}"
+    )
+    bundle_dir = bundle_dirs[0]
+    assert bundle_dir.name == "synthesize-20260617T000000Z", (
+        f"BLOCKED bundle dir name must equal the frozen "
+        f"run_id 'synthesize-20260617T000000Z' "
+        f"(FROZEN_NOW='{FROZEN_NOW}' with colons+hyphens "
+        f"stripped); got {bundle_dir.name!r}"
+    )
+    receipt_path = bundle_dir / "receipt.json"
+    summary_path = bundle_dir / "summary.json"
+    trajectory_path = bundle_dir / "trajectory-digest.json"
+    for path in (receipt_path, summary_path, trajectory_path):
+        assert path.is_file(), (
+            f"BLOCKED bundle must write {path.name!r}; got "
+            f"missing={path!r}"
+        )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt.get("status") == "BLOCKED", (
+        f"BLOCKED receipt status must be 'BLOCKED'; got "
+        f"{receipt.get('status')!r}"
+    )
+    assert (
+        receipt.get("run_type") == "synthesize_evaluation_stage"
+    ), (
+        f"BLOCKED receipt run_type must be "
+        f"'synthesize_evaluation_stage' (ADR 0035); got "
+        f"{receipt.get('run_type')!r}"
+    )
+    receipt_blocker_ids = [
+        b.get("id") for b in receipt.get("blockers", [])
+        if isinstance(b, dict)
+    ]
+    assert "no-eval-improvement" in receipt_blocker_ids, (
+        f"BLOCKED receipt must carry the stub blocker id; got "
+        f"{receipt_blocker_ids!r}"
+    )
+
+    # The payload must carry the BLOCKED bundle refs alongside
+    # any optimizer evidence_refs (Task 4 step 5).
+    payload_evidence_refs = payload.get("evidence_refs") or {}
+    assert (
+        payload_evidence_refs.get("blocked_receipt")
+        == f"{bundle_dir.name}/receipt.json"
+    ), (
+        f"payload evidence_refs.blocked_receipt must point at "
+        f"the BLOCKED bundle receipt; got "
+        f"{payload_evidence_refs.get('blocked_receipt')!r}"
+    )
+    assert (
+        payload_evidence_refs.get("blocked_summary")
+        == f"{bundle_dir.name}/summary.json"
+    ), (
+        f"payload evidence_refs.blocked_summary must point at "
+        f"the BLOCKED bundle summary; got "
+        f"{payload_evidence_refs.get('blocked_summary')!r}"
+    )
+    assert (
+        payload_evidence_refs.get("blocked_trajectory_digest")
+        == f"{bundle_dir.name}/trajectory-digest.json"
+    ), (
+        f"payload evidence_refs.blocked_trajectory_digest "
+        f"must point at the BLOCKED bundle trajectory digest; "
+        f"got "
+        f"{payload_evidence_refs.get('blocked_trajectory_digest')!r}"
     )
 
 
@@ -1430,7 +1634,7 @@ def test_synthesize_keeps_pending_review_without_optimizer_call(
         )
 
     monkeypatch.setattr(
-        synth_mod, "run_optimizer_pipeline", _must_not_call
+        synth_mod, "run_synthesis_optimizer", _must_not_call
     )
 
     ns = _synthesize_namespace(
