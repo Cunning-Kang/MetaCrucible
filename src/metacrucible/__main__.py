@@ -78,6 +78,7 @@ from .exit_codes import (
 )
 from .promote import _atomic_write_jsonl, promote_case
 from .storage import RepositoryStorage, UserGlobalStorage
+from .synthesize import run_synthesize_command
 from . import rule_checks as _rule_checks
 
 __all__ = [
@@ -618,6 +619,27 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="emit a parseable JSON object on stdout",
     )
+    # Task 1 of MetaCrucible issue #41 (PRD F4) ships the parser
+    # shell + a transient ``synthesize-not-implemented`` placeholder;
+    # Task 2 replaces the placeholder with the real synthesis pipeline.
+    synthesize_parser = subparsers.add_parser(
+        "synthesize",
+        help=(
+            "create a new capability artifact from a freeform "
+            "capability-need or a spec file"
+        ),
+    )
+    # Mutually exclusive input group; required=True so missing or
+    # conflicting input raises SystemExit(2) before dispatch.
+    synthesize_input = synthesize_parser.add_mutually_exclusive_group(required=True)
+    synthesize_input.add_argument("capability_need", nargs="?", help="freeform capability-need text; mutually exclusive with --from")
+    synthesize_input.add_argument("--from", dest="from_spec", default=None, metavar="SPEC", help="spec file path; mutually exclusive with positional capability_need")
+    synthesize_parser.add_argument("--output", required=True, help="path to write the synthesized capability artifact to (created by Task 2)")
+    synthesize_parser.add_argument("--max-rounds", dest="max_rounds", type=int, default=ROUND_BUDGET_DEFAULT, help=f"max optimization rounds (default: {ROUND_BUDGET_DEFAULT})")
+    synthesize_parser.add_argument("--allow-routing-revision", dest="allow_routing_revision", action="store_true", help="explicit confirmation that a routing revision may enter a candidate revision; aligned with optimize")
+    synthesize_parser.add_argument("--allow-dirty-unrelated", dest="allow_dirty_unrelated", action="store_true", help="record dirty-file list and proceed even with unrelated dirty files; aligned with optimize")
+    synthesize_parser.add_argument("--confirm-resume", dest="confirm_resume", action="store_true", help="explicit confirmation that interrupted synthesis runs may be resumed; aligned with optimize")
+    synthesize_parser.add_argument("--json", dest="json", action="store_true", help="emit a parseable JSON object on stdout")
     # ``verify``) extend the same nested parser without breaking
     # the ``baseline`` outer shape. ``dest="baseline_action"`` on
     # the inner subparser so the dispatcher can branch on
@@ -3005,6 +3027,24 @@ def cmd_optimize(args: argparse.Namespace) -> int:
 
 
 
+def cmd_synthesize(args: argparse.Namespace) -> int:
+    """Run the ``synthesize`` subcommand; return the exit code.
+
+    Thin wrapper around
+    :func:`metacrucible.synthesize.run_synthesize_command`
+    (Issue #41 / PRD F4 Task 2). The real synthesis pipeline
+    lives in :mod:`metacrucible.synthesize`; this function
+    only threads the shared ``_emit`` and ``_now_iso``
+    helpers into the dispatcher and returns the stable
+    exit code.
+    """
+    return run_synthesize_command(
+        args,
+        emit=lambda payload: _emit(payload, as_json=args.json),
+        now=_now_iso,
+    )
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     """Run the ``init`` subcommand; return the process exit code."""
     workspace = Path(args.workspace).resolve()
@@ -3901,6 +3941,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_bootstrap(args)
         if getattr(args, "command", None) == "optimize":
             return cmd_optimize(args)
+        if getattr(args, "command", None) == "synthesize":
+            return cmd_synthesize(args)
         if getattr(args, "command", None) == "baseline":
             return cmd_baseline(args)
         if getattr(args, "command", None) == "evaluate":
