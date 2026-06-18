@@ -3244,40 +3244,66 @@ def cmd_review(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _emit_inspect_human(payload: Mapping[str, Any]) -> None:
+    print(f"Artifact path: {payload['artifact_path']}")
+    print(f"Envelope status: {payload.get('envelope_status') or '(unknown)'}")
+    print(f"Current best revision id: {payload.get('current_best_revision_id') or '(none)'}")
+    print("Revision history:")
+    print("revision_id | status | accepted_at | eval_score | held_out_delta")
+    for revision in payload["revision_history"]:
+        print(
+            f"{revision.get('revision_id') or ''} | "
+            f"{revision.get('status') or ''} | "
+            f"{revision.get('accepted_at') or ''} | "
+            f"{revision.get('eval_score') if revision.get('eval_score') is not None else ''} | "
+            f"{revision.get('held_out_delta') if revision.get('held_out_delta') is not None else ''}"
+        )
+    if not payload["revision_history"]:
+        print("(none)")
+    print("Acceptance decisions:")
+    for decision in payload["acceptance_decisions"]:
+        print(f"- {decision.get('revision_id')}: status={decision.get('status')}")
+    if not payload["acceptance_decisions"]:
+        print("- (none)")
+    print("Evidence bundle index:")
+    for bundle in payload["evidence_bundles"]:
+        print(f"- {bundle.get('receipt_path')}")
+    if not payload["evidence_bundles"]:
+        print("- (none)")
+
+
 def cmd_inspect(args: argparse.Namespace) -> int:
     """Run the ``inspect`` subcommand; return the process exit code.
 
-    Task 1 thin wrapper (PRD F5 / Issue #42 tracer bullet):
+    Issue #42 / PRD F5 read-only reader:
 
-      - The artifact / workspace path must exist on disk; a
-        missing path is reported to ``stderr`` and the
-        command returns :data:`EXIT_USER_ERROR` without
-        writing any BLOCKED evidence bundle.
-      - On a present path, the wrapper emits a minimal
-        ``status: ok`` payload that names the resolved
-        artifact path and the sibling workspace directory.
-        Later tasks replace this temporary payload with the
-        full revision-history / acceptance-decision reader
-        pinned by the F5 acceptance criteria.
-      - No files on disk are modified.
+      - Resolves the artifact path and loads its sibling
+        ``.metacrucible/`` workspace (state, envelope, and
+        append-only history) via
+        :func:`metacrucible.inspect.build_inspect_payload`.
+      - Emits a stable payload in either ``--json`` form or a
+        deterministic human rendering that names the artifact
+        path, envelope status, current best revision id, a
+        revision-history table, acceptance decisions, and an
+        evidence-bundle index.
+      - On a precondition failure (missing path, missing
+        workspace, missing ``state.json`` / ``envelope.json``,
+        or malformed JSON), writes a clean ``metacrucible:``
+        line to ``stderr`` and returns
+        :data:`EXIT_USER_ERROR`. No files on disk are
+        modified and no BLOCKED evidence bundle is written.
     """
-    target = Path(args.path).resolve()
-    if not target.exists():
-        print(
-            f"metacrucible: inspect path {target} does not exist",
-            file=sys.stderr,
-        )
+    from .inspect import build_inspect_payload
+
+    try:
+        payload = build_inspect_payload(Path(args.path))
+    except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+        print(f"metacrucible: {exc}", file=sys.stderr)
         return EXIT_USER_ERROR
-    workspace_path = (
-        target if target.name == REPO_DIR_NAME
-        else target.parent / REPO_DIR_NAME
-    )
-    payload = {
-        "artifact_path": str(target),
-        "workspace_path": str(workspace_path),
-        "status": "ok",
-    }
-    _emit(payload, as_json=args.json)
+    if args.json:
+        _emit(payload, as_json=True)
+    else:
+        _emit_inspect_human(payload)
     return EXIT_OK
 
 

@@ -9,8 +9,7 @@ a BLOCKED evidence bundle:
     ``path`` positional plus the ``--json`` flag.
   - ``main(['inspect', <artifact>, '--json'])`` dispatches to
     :func:`metacrucible.__main__.cmd_inspect` and returns
-    :data:`metacrucible.exit_codes.EXIT_OK` for the temporary
-    Task 1 payload.
+    :data:`metacrucible.exit_codes.EXIT_OK`.
   - A missing path is reported to ``stderr`` and returns a
     non-zero exit code without creating
     ``$HOME/.metacrucible/evidence/`` on disk.
@@ -18,15 +17,23 @@ a BLOCKED evidence bundle:
     :func:`metacrucible.blocked_bundles.write_blocked_bundle`; the
     missing-path branch must stay free of any BLOCKED-bundle write.
 
-Later tasks replace the temporary ``status: ok`` payload with the
-full revision-history / acceptance-decision reader pinned by the
-F5 acceptance criteria; the read-only / no-bundle contract proven
-here must stay true throughout.
+Task 2 replaces the temporary Task 1 payload with the real-schema
+reader pinned by the F5 acceptance criteria: inspect consumes
+``.metacrucible/state.json`` (with ``schema_version``,
+``current_best_revision``, ``last_run_id``, ``baseline``),
+``envelope.json``, and the optimizer's append-only
+``history.jsonl`` of event-shaped records
+(``optimize_started`` / ``optimize_accepted`` /
+``optimize_rejected`` with nested ``decision`` dicts). The reader
+must surface a revision history table, acceptance decisions, and
+the current best revision id; the read-only / no-bundle contract
+proven in Task 1 must stay true throughout.
 """
 from __future__ import annotations
 
 import argparse
 import inspect
+import json
 
 import pytest
 
@@ -164,19 +171,255 @@ def test_inspect_dispatch_smoke_returns_exit_ok(
     isolated_global_home: str,
 ) -> None:
     """``main(['inspect', <artifact>, '--json'])`` reaches
-    :func:`cmd_inspect` and returns :data:`EXIT_OK` for the
-    temporary Task 1 payload.
+    :func:`cmd_inspect` and returns :data:`EXIT_OK`.
 
-    The artifact path must exist for the thin wrapper to return
-    the success branch; the packet specifies a sibling
-    ``.metacrucible/`` directory so the wrapper's workspace-path
-    computation matches the canonical convention.
+    The smoke test pins dispatch end-to-end (parser + ``cmd_inspect``
+    + JSON emission) for the real-schema reader. The fixture writes
+    a minimal valid state plus a single optimizer event record so
+    the reader takes its success branch.
     """
-    artifact = tmp_path / "artifact.md"
-    artifact.write_text("# stub artifact\n", encoding="utf-8")
-    workspace = tmp_path / ".metacrucible"
-    workspace.mkdir()
+    artifact, _workspace = make_inspect_workspace(tmp_path)
 
     rc = main(["inspect", str(artifact), "--json"])
 
     assert rc == EXIT_OK
+
+
+# --------------------------------------------------------------------------- #
+# Task 2 — fixture helpers for state / envelope / history (PRD F5)           #
+# --------------------------------------------------------------------------- #
+
+
+def _write_json(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+
+def _append_history(workspace, records):
+    (workspace / "history.jsonl").write_text(
+        "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+
+def _decision(round_id, revision_id, *, accepted, eval_score, held_out_delta, accepted_at):
+    return {
+        "round_id": round_id,
+        "revision_id": revision_id,
+        "accepted": accepted,
+        "status": "ACCEPTED" if accepted else "REJECTED",
+        "eval_score": eval_score,
+        "held_out_delta": held_out_delta,
+        "accepted_at": accepted_at,
+    }
+
+
+def make_inspect_workspace(tmp_path):
+    artifact = tmp_path / "artifact.md"
+    artifact.write_text("# Artifact\n", encoding="utf-8")
+    workspace = tmp_path / ".metacrucible"
+    workspace.mkdir()
+    _write_json(workspace / "envelope.json", {"status": "ready"})
+    _write_json(
+        workspace / "state.json",
+        {
+            "schema_version": 1,
+            "current_best_revision": "rev-001",
+            "last_run_id": "run-001",
+            "baseline": {"artifact_path": str(artifact)},
+        },
+    )
+    _append_history(
+        workspace,
+        [
+            {
+                "event": "optimize_started",
+                "run_id": "run-001",
+                "workspace": str(tmp_path),
+                "artifact_path": str(artifact),
+                "base_content_hash": "sha256:base",
+                "max_rounds": 2,
+                "human_confirmed": True,
+                "timestamp": "2026-06-18T00:00:00Z",
+            },
+            {
+                "event": "optimize_rejected",
+                "run_id": "run-001",
+                "round_id": "round-001",
+                "decision": _decision(
+                    "round-001",
+                    "rev-000",
+                    accepted=False,
+                    eval_score=0.70,
+                    held_out_delta=-0.01,
+                    accepted_at=None,
+                ),
+                "timestamp": "2026-06-18T00:01:00Z",
+            },
+            {
+                "event": "optimize_accepted",
+                "run_id": "run-001",
+                "round_id": "round-002",
+                "decision": _decision(
+                    "round-002",
+                    "rev-001",
+                    accepted=True,
+                    eval_score=0.75,
+                    held_out_delta=0.03,
+                    accepted_at="2026-06-18T00:02:00Z",
+                ),
+                "timestamp": "2026-06-18T00:02:00Z",
+            },
+        ],
+    )
+    return artifact, workspace
+
+
+def snapshot_tree(root):
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Task 2 — JSON happy path                                                    #
+# --------------------------------------------------------------------------- #
+
+
+def test_inspect_json_reads_real_state_and_event_history(tmp_path, capsys):
+    from metacrucible.__main__ import cmd_inspect
+
+    artifact, _workspace = make_inspect_workspace(tmp_path)
+
+    code = cmd_inspect(argparse.Namespace(path=str(artifact), json=True))
+
+    captured = capsys.readouterr()
+    assert code == EXIT_OK
+    payload = json.loads(captured.out)
+    assert set(payload) == {
+        "artifact_path",
+        "workspace_path",
+        "envelope_status",
+        "current_best_revision_id",
+        "revision_history",
+        "acceptance_decisions",
+        "evidence_bundles",
+    }
+    assert payload["envelope_status"] == "ready"
+    assert payload["current_best_revision_id"] == "rev-001"
+    assert payload["revision_history"] == [
+        {
+            "event": "optimize_started",
+            "run_id": "run-001",
+            "round_id": None,
+            "revision_id": None,
+            "status": "STARTED",
+            "accepted_at": None,
+            "eval_score": None,
+            "held_out_delta": None,
+            "timestamp": "2026-06-18T00:00:00Z",
+        },
+        {
+            "event": "optimize_rejected",
+            "run_id": "run-001",
+            "round_id": "round-001",
+            "revision_id": "rev-000",
+            "status": "REJECTED",
+            "accepted_at": None,
+            "eval_score": 0.70,
+            "held_out_delta": -0.01,
+            "timestamp": "2026-06-18T00:01:00Z",
+        },
+        {
+            "event": "optimize_accepted",
+            "run_id": "run-001",
+            "round_id": "round-002",
+            "revision_id": "rev-001",
+            "status": "ACCEPTED",
+            "accepted_at": "2026-06-18T00:02:00Z",
+            "eval_score": 0.75,
+            "held_out_delta": 0.03,
+            "timestamp": "2026-06-18T00:02:00Z",
+        },
+    ]
+    assert payload["acceptance_decisions"] == [
+        {
+            "event": "optimize_rejected",
+            "run_id": "run-001",
+            "round_id": "round-001",
+            "revision_id": "rev-000",
+            "status": "REJECTED",
+            "accepted": False,
+            "accepted_at": None,
+            "eval_score": 0.70,
+            "held_out_delta": -0.01,
+            "timestamp": "2026-06-18T00:01:00Z",
+        },
+        {
+            "event": "optimize_accepted",
+            "run_id": "run-001",
+            "round_id": "round-002",
+            "revision_id": "rev-001",
+            "status": "ACCEPTED",
+            "accepted": True,
+            "accepted_at": "2026-06-18T00:02:00Z",
+            "eval_score": 0.75,
+            "held_out_delta": 0.03,
+            "timestamp": "2026-06-18T00:02:00Z",
+        },
+    ]
+    assert payload["evidence_bundles"] == []
+    assert "blockers" not in payload
+    assert "evidence_refs" not in payload
+
+
+# --------------------------------------------------------------------------- #
+# Task 2 — human output                                                       #
+# --------------------------------------------------------------------------- #
+
+
+def test_inspect_human_output_shows_required_sections(tmp_path, capsys):
+    from metacrucible.__main__ import cmd_inspect
+
+    artifact, _workspace = make_inspect_workspace(tmp_path)
+
+    code = cmd_inspect(argparse.Namespace(path=str(artifact), json=False))
+
+    captured = capsys.readouterr()
+    assert code == EXIT_OK
+    assert "Artifact path:" in captured.out
+    assert "Envelope status:" in captured.out
+    assert "Current best revision id: rev-001" in captured.out
+    assert "Revision history:" in captured.out
+    assert "revision_id | status | accepted_at | eval_score | held_out_delta" in captured.out
+    assert "rev-000 | REJECTED |  | 0.7 | -0.01" in captured.out
+    assert "rev-001 | ACCEPTED | 2026-06-18T00:02:00Z | 0.75 | 0.03" in captured.out
+    assert "Acceptance decisions:" in captured.out
+    assert "Evidence bundle index:" in captured.out
+
+
+# --------------------------------------------------------------------------- #
+# Task 2 — missing state, no BLOCKED evidence bundle                          #
+# --------------------------------------------------------------------------- #
+
+
+def test_inspect_missing_state_returns_clean_error_without_blocked_bundle(
+    tmp_path, monkeypatch, capsys
+):
+    from metacrucible.__main__ import cmd_inspect
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    artifact = tmp_path / "artifact.md"
+    artifact.write_text("# Artifact\n", encoding="utf-8")
+    (tmp_path / ".metacrucible").mkdir()
+
+    code = cmd_inspect(argparse.Namespace(path=str(artifact), json=True))
+
+    captured = capsys.readouterr()
+    assert code == EXIT_USER_ERROR
+    assert captured.out == ""
+    assert "missing state.json" in captured.err
+    assert not (home / ".metacrucible" / "evidence").exists()
