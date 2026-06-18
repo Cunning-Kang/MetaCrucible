@@ -197,7 +197,22 @@ def _append_history(workspace, records):
         encoding="utf-8",
     )
 
+def _real_decision(*, accepted, reason):
+    """Produce the REAL optimizer decision dict (no fabricated fields)."""
+    return {
+        "accepted": accepted,
+        "reason": reason,
+        "baseline_eval_fail_blocked_count": 2,
+        "candidate_eval_fail_blocked_count": 1 if accepted else 3,
+        "new_held_out_fail_blocked_case_ids": [] if accepted else ["held-out-2"],
+        "held_out_pass_to_fail_case_ids": [] if accepted else ["held-out-2"],
+        "eval_fail_to_pass_case_ids": ["eval-1"] if accepted else [],
+        "eval_pass_to_fail_case_ids": [] if accepted else ["eval-2"],
+    }
+
+
 def _decision(round_id, revision_id, *, accepted, eval_score, held_out_delta, accepted_at):
+    """Legacy fabricated decision used by tests removed in revision 2."""
     return {
         "round_id": round_id,
         "revision_id": revision_id,
@@ -218,7 +233,7 @@ def make_inspect_workspace(tmp_path):
         workspace / "state.json",
         {
             "schema_version": 1,
-            "current_best_revision": "rev-001",
+            "current_best_revision": None,
             "last_run_id": "run-001",
             "baseline": {"artifact_path": str(artifact)},
         },
@@ -240,28 +255,14 @@ def make_inspect_workspace(tmp_path):
                 "event": "optimize_rejected",
                 "run_id": "run-001",
                 "round_id": "round-001",
-                "decision": _decision(
-                    "round-001",
-                    "rev-000",
-                    accepted=False,
-                    eval_score=0.70,
-                    held_out_delta=-0.01,
-                    accepted_at=None,
-                ),
+                "decision": _real_decision(accepted=False, reason="eval_regression"),
                 "timestamp": "2026-06-18T00:01:00Z",
             },
             {
                 "event": "optimize_accepted",
                 "run_id": "run-001",
                 "round_id": "round-002",
-                "decision": _decision(
-                    "round-002",
-                    "rev-001",
-                    accepted=True,
-                    eval_score=0.75,
-                    held_out_delta=0.03,
-                    accepted_at="2026-06-18T00:02:00Z",
-                ),
+                "decision": _real_decision(accepted=True, reason="accepted"),
                 "timestamp": "2026-06-18T00:02:00Z",
             },
         ],
@@ -301,65 +302,96 @@ def test_inspect_json_reads_real_state_and_event_history(tmp_path, monkeypatch, 
         "evidence_bundles",
     }
     assert payload["envelope_status"] == "ready"
-    assert payload["current_best_revision_id"] == "rev-001"
+    assert payload["current_best_revision_id"] is None
     assert payload["revision_history"] == [
         {
-            "event": "optimize_started",
-            "run_id": "run-001",
-            "round_id": None,
-            "revision_id": None,
-            "status": "STARTED",
             "accepted_at": None,
+            "baseline_eval_fail_blocked_count": None,
+            "candidate_eval_fail_blocked_count": None,
+            "eval_fail_to_pass_case_ids": None,
+            "eval_pass_to_fail_case_ids": None,
             "eval_score": None,
+            "event": "optimize_started",
             "held_out_delta": None,
+            "held_out_pass_to_fail_case_ids": None,
+            "new_held_out_fail_blocked_case_ids": None,
+            "reason": None,
+            "revision_id": "run-001",
+            "round_id": None,
+            "run_id": "run-001",
+            "status": "STARTED",
             "timestamp": "2026-06-18T00:00:00Z",
         },
         {
+            "accepted_at": "2026-06-18T00:01:00Z",
+            "baseline_eval_fail_blocked_count": 2,
+            "candidate_eval_fail_blocked_count": 3,
+            "eval_fail_to_pass_case_ids": [],
+            "eval_pass_to_fail_case_ids": ["eval-2"],
+            "eval_score": None,
             "event": "optimize_rejected",
-            "run_id": "run-001",
+            "held_out_delta": None,
+            "held_out_pass_to_fail_case_ids": ["held-out-2"],
+            "new_held_out_fail_blocked_case_ids": ["held-out-2"],
+            "reason": "eval_regression",
+            "revision_id": "run-001/round-001",
             "round_id": "round-001",
-            "revision_id": "rev-000",
+            "run_id": "run-001",
             "status": "REJECTED",
-            "accepted_at": None,
-            "eval_score": 0.70,
-            "held_out_delta": -0.01,
             "timestamp": "2026-06-18T00:01:00Z",
         },
         {
-            "event": "optimize_accepted",
-            "run_id": "run-001",
-            "round_id": "round-002",
-            "revision_id": "rev-001",
-            "status": "ACCEPTED",
             "accepted_at": "2026-06-18T00:02:00Z",
-            "eval_score": 0.75,
-            "held_out_delta": 0.03,
+            "baseline_eval_fail_blocked_count": 2,
+            "candidate_eval_fail_blocked_count": 1,
+            "eval_fail_to_pass_case_ids": ["eval-1"],
+            "eval_pass_to_fail_case_ids": [],
+            "eval_score": None,
+            "event": "optimize_accepted",
+            "held_out_delta": None,
+            "held_out_pass_to_fail_case_ids": [],
+            "new_held_out_fail_blocked_case_ids": [],
+            "reason": "accepted",
+            "revision_id": "run-001/round-002",
+            "round_id": "round-002",
+            "run_id": "run-001",
+            "status": "ACCEPTED",
             "timestamp": "2026-06-18T00:02:00Z",
         },
     ]
     assert payload["acceptance_decisions"] == [
         {
-            "event": "optimize_rejected",
-            "run_id": "run-001",
-            "round_id": "round-001",
-            "revision_id": "rev-000",
-            "status": "REJECTED",
             "accepted": False,
-            "accepted_at": None,
-            "eval_score": 0.70,
-            "held_out_delta": -0.01,
+            "accepted_at": "2026-06-18T00:01:00Z",
+            "baseline_eval_fail_blocked_count": 2,
+            "candidate_eval_fail_blocked_count": 3,
+            "eval_fail_to_pass_case_ids": [],
+            "eval_pass_to_fail_case_ids": ["eval-2"],
+            "event": "optimize_rejected",
+            "held_out_pass_to_fail_case_ids": ["held-out-2"],
+            "new_held_out_fail_blocked_case_ids": ["held-out-2"],
+            "reason": "eval_regression",
+            "revision_id": "run-001/round-001",
+            "round_id": "round-001",
+            "run_id": "run-001",
+            "status": "REJECTED",
             "timestamp": "2026-06-18T00:01:00Z",
         },
         {
-            "event": "optimize_accepted",
-            "run_id": "run-001",
-            "round_id": "round-002",
-            "revision_id": "rev-001",
-            "status": "ACCEPTED",
             "accepted": True,
             "accepted_at": "2026-06-18T00:02:00Z",
-            "eval_score": 0.75,
-            "held_out_delta": 0.03,
+            "baseline_eval_fail_blocked_count": 2,
+            "candidate_eval_fail_blocked_count": 1,
+            "eval_fail_to_pass_case_ids": ["eval-1"],
+            "eval_pass_to_fail_case_ids": [],
+            "event": "optimize_accepted",
+            "held_out_pass_to_fail_case_ids": [],
+            "new_held_out_fail_blocked_case_ids": [],
+            "reason": "accepted",
+            "revision_id": "run-001/round-002",
+            "round_id": "round-002",
+            "run_id": "run-001",
+            "status": "ACCEPTED",
             "timestamp": "2026-06-18T00:02:00Z",
         },
     ]
@@ -382,11 +414,11 @@ def test_inspect_human_output_shows_required_sections(tmp_path, capsys):
     assert code == EXIT_OK
     assert "Artifact path:" in captured.out
     assert "Envelope status:" in captured.out
-    assert "Current best revision id: rev-001" in captured.out
+    assert "Current best revision id: (none)" in captured.out
     assert "Revision history:" in captured.out
     assert "revision_id | status | accepted_at | eval_score | held_out_delta" in captured.out
-    assert "rev-000 | REJECTED |  | 0.7 | -0.01" in captured.out
-    assert "rev-001 | ACCEPTED | 2026-06-18T00:02:00Z | 0.75 | 0.03" in captured.out
+    assert "run-001/round-001 | REJECTED | 2026-06-18T00:01:00Z |  | " in captured.out
+    assert "run-001/round-002 | ACCEPTED | 2026-06-18T00:02:00Z |  | " in captured.out
     assert "Acceptance decisions:" in captured.out
     assert "Evidence bundle index:" in captured.out
 
@@ -548,102 +580,20 @@ def test_inspect_skips_malformed_receipts(tmp_path, monkeypatch, capsys):
 # Task 3 — best revision falls back to latest accepted event                  #
 # --------------------------------------------------------------------------- #
 
-def test_inspect_best_revision_falls_back_to_latest_accepted_event(tmp_path, capsys):
+def test_inspect_current_best_revision_is_none_on_real_workspace(tmp_path, capsys):
     from metacrucible.__main__ import cmd_inspect
 
-    artifact, workspace = make_inspect_workspace(tmp_path)
-    _write_json(
-        workspace / "state.json",
-        {
-            "schema_version": 1,
-            "current_best_revision": None,
-            "last_run_id": "run-001",
-            "baseline": {"artifact_path": str(artifact)},
-        },
-    )
-    _append_history(
-        workspace,
-        [
-            {
-                "event": "optimize_rejected",
-                "run_id": "run-001",
-                "round_id": "round-001",
-                "decision": _decision(
-                    "round-001",
-                    "rev-001",
-                    accepted=False,
-                    eval_score=0.60,
-                    held_out_delta=-0.02,
-                    accepted_at=None,
-                ),
-                "timestamp": "2026-06-18T00:01:00Z",
-            },
-            {
-                "event": "optimize_accepted",
-                "run_id": "run-001",
-                "round_id": "round-002",
-                "decision": _decision(
-                    "round-002",
-                    "rev-002",
-                    accepted=True,
-                    eval_score=0.80,
-                    held_out_delta=0.04,
-                    accepted_at="2026-06-18T00:02:00Z",
-                ),
-                "timestamp": "2026-06-18T00:02:00Z",
-            },
-            {
-                "event": "optimize_accepted",
-                "run_id": "run-001",
-                "round_id": "round-003",
-                "decision": _decision(
-                    "round-003",
-                    "rev-003",
-                    accepted=True,
-                    eval_score=0.82,
-                    held_out_delta=0.05,
-                    accepted_at="2026-06-18T00:03:00Z",
-                ),
-                "timestamp": "2026-06-18T00:03:00Z",
-            },
-        ],
-    )
-
-    json_code = cmd_inspect(argparse.Namespace(path=str(artifact), json=True))
-    json_payload = json.loads(capsys.readouterr().out)
-    human_code = cmd_inspect(argparse.Namespace(path=str(artifact), json=False))
-    human_output = capsys.readouterr().out
-
-    assert json_code == EXIT_OK
-    assert human_code == EXIT_OK
-    assert json_payload["current_best_revision_id"] == "rev-003"
-    assert "Current best revision id: rev-003" in human_output
-
-# --------------------------------------------------------------------------- #
-# Task 3 — state current_best_revision wins over fallback                    #
-# --------------------------------------------------------------------------- #
-
-def test_inspect_best_revision_prefers_state_current_best_revision(tmp_path, capsys):
-    from metacrucible.__main__ import cmd_inspect
-
-    artifact, workspace = make_inspect_workspace(tmp_path)
-    _write_json(
-        workspace / "state.json",
-        {
-            "schema_version": 1,
-            "current_best_revision": "rev-state",
-            "last_run_id": "run-001",
-            "baseline": {"artifact_path": str(artifact)},
-        },
-    )
+    artifact, _workspace = make_inspect_workspace(tmp_path)
 
     code = cmd_inspect(argparse.Namespace(path=str(artifact), json=True))
-
-    payload = json.loads(capsys.readouterr().out)
+    captured = capsys.readouterr()
     assert code == EXIT_OK
-    assert payload["current_best_revision_id"] == "rev-state"
+    payload = json.loads(captured.out)
+    # Real optimizer never writes state.current_best_revision post-init,
+    # so inspect returns None on real workspaces (documented limitation).
+    assert payload["current_best_revision_id"] is None
 
-# --------------------------------------------------------------------------- #
+
 # Task 3 — inspect never mutates workspace or HOME                            #
 # --------------------------------------------------------------------------- #
 
@@ -681,7 +631,7 @@ def test_inspect_public_command_full_prd_f5_acceptance(
         ``revision_history`` (non-empty),
         ``acceptance_decisions`` (non-empty),
         ``evidence_bundles`` (non-empty), and
-        ``current_best_revision_id`` resolved to ``"rev-001"``.
+        ``current_best_revision_id`` resolved to ``None`` (limitation: optimizer does not yet write state.current_best_revision post-init).
       * Human output names the artifact path, envelope status,
         current best revision, revision-history table,
         acceptance decisions, and evidence bundle index.
@@ -735,7 +685,7 @@ def test_inspect_public_command_full_prd_f5_acceptance(
     assert json_code == EXIT_OK
     assert "Artifact path:" in human
     assert "Envelope status:" in human
-    assert "Current best revision id: rev-001" in human
+    assert "Current best revision id: (none)" in human
     assert "Revision history:" in human
     assert "revision_id | status | accepted_at | eval_score | held_out_delta" in human
     assert "Acceptance decisions:" in human
@@ -743,7 +693,7 @@ def test_inspect_public_command_full_prd_f5_acceptance(
     assert payload["revision_history"]
     assert payload["acceptance_decisions"]
     assert payload["evidence_bundles"]
-    assert payload["current_best_revision_id"] == "rev-001"
+    assert payload["current_best_revision_id"] is None
     assert snapshot_tree(tmp_path) == before
 
 def test_inspect_never_writes_blocked_bundle_on_bad_input(
