@@ -77,7 +77,7 @@ from .exit_codes import (
     EXIT_USER_ERROR,
 )
 from .promote import _atomic_write_jsonl, promote_case
-from .storage import RepositoryStorage, UserGlobalStorage
+from .storage import REPO_DIR_NAME, RepositoryStorage, UserGlobalStorage
 from .synthesize import run_synthesize_command
 from . import rule_checks as _rule_checks
 
@@ -712,6 +712,25 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     evaluate_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="emit a parseable JSON object on stdout",
+    )
+    inspect_parser = subparsers.add_parser(
+        "inspect",
+        help=(
+            "read prior MetaCrucible optimization state for an "
+            "artifact or workspace (PRD F5 / Issue #42)"
+        ),
+    )
+    inspect_parser.add_argument(
+        "path",
+        help=(
+            "path to a capability artifact or to its "
+            ".metacrucible workspace"
+        ),
+    )
+    inspect_parser.add_argument(
         "--json",
         action="store_true",
         help="emit a parseable JSON object on stdout",
@@ -3225,6 +3244,69 @@ def cmd_review(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _emit_inspect_human(payload: Mapping[str, Any]) -> None:
+    print(f"Artifact path: {payload['artifact_path']}")
+    print(f"Envelope status: {payload.get('envelope_status') or '(unknown)'}")
+    print(f"Current best revision id: {payload.get('current_best_revision_id') or '(none)'}")
+    print("Revision history:")
+    print("revision_id | status | accepted_at | eval_score | held_out_delta")
+    for revision in payload["revision_history"]:
+        print(
+            f"{revision.get('revision_id') or ''} | "
+            f"{revision.get('status') or ''} | "
+            f"{revision.get('accepted_at') or ''} | "
+            f"{revision.get('eval_score') if revision.get('eval_score') is not None else ''} | "
+            f"{revision.get('held_out_delta') if revision.get('held_out_delta') is not None else ''}"
+        )
+    if not payload["revision_history"]:
+        print("(none)")
+    print("Acceptance decisions:")
+    for decision in payload["acceptance_decisions"]:
+        print(f"- {decision.get('revision_id')}: status={decision.get('status')}")
+    if not payload["acceptance_decisions"]:
+        print("- (none)")
+    print("Evidence bundle index:")
+    for bundle in payload["evidence_bundles"]:
+        print(f"- {bundle.get('receipt_path')}")
+    if not payload["evidence_bundles"]:
+        print("- (none)")
+
+
+def cmd_inspect(args: argparse.Namespace) -> int:
+    """Run the ``inspect`` subcommand; return the process exit code.
+
+    Issue #42 / PRD F5 read-only reader:
+
+      - Resolves the artifact path and loads its sibling
+        ``.metacrucible/`` workspace (state, envelope, and
+        append-only history) via
+        :func:`metacrucible.inspect.build_inspect_payload`.
+      - Emits a stable payload in either ``--json`` form or a
+        deterministic human rendering that names the artifact
+        path, envelope status, current best revision id, a
+        revision-history table, acceptance decisions, and an
+        evidence-bundle index.
+      - On a precondition failure (missing path, missing
+        workspace, missing ``state.json`` / ``envelope.json``,
+        or malformed JSON), writes a clean ``metacrucible:``
+        line to ``stderr`` and returns
+        :data:`EXIT_USER_ERROR`. No files on disk are
+        modified and no BLOCKED evidence bundle is written.
+    """
+    from .inspect import build_inspect_payload
+
+    try:
+        payload = build_inspect_payload(Path(args.path))
+    except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+        print(f"metacrucible: {exc}", file=sys.stderr)
+        return EXIT_USER_ERROR
+    if args.json:
+        _emit(payload, as_json=True)
+    else:
+        _emit_inspect_human(payload)
+    return EXIT_OK
+
+
 def _baseline_git_dirty_check(
     workspace: Path, baseline_inputs: list[Path]
 ) -> tuple[bool, list[str], bool]:
@@ -3947,6 +4029,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_baseline(args)
         if getattr(args, "command", None) == "evaluate":
             return cmd_evaluate(args)
+        if getattr(args, "command", None) == "inspect":
+            return cmd_inspect(args)
         return EXIT_OK
     except Exception as exc:  # noqa: BLE001 - exit-code firewall
         # Catch-all so an uncaught command-handler bug still
