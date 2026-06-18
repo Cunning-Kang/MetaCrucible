@@ -99,6 +99,59 @@ def _project_acceptance_decision(record: Mapping[str, Any]) -> dict[str, Any] | 
     }
 
 
+def _load_evidence_bundles() -> list[dict[str, Any]]:
+    evidence_root = Path.home() / ".metacrucible" / "evidence"
+    if not evidence_root.is_dir():
+        return []
+    bundles: list[dict[str, Any]] = []
+    for receipt_path in sorted(evidence_root.glob("*/receipt.json")):
+        try:
+            receipt = _load_json(receipt_path)
+            summary_ref = receipt.get("summary_ref", "summary.json")
+            run_id = str(receipt.get("run_id") or receipt_path.parent.name)
+        except (json.JSONDecodeError, OSError, ValueError):
+            # A single malformed or unreadable receipt must not
+            # crash the entire inspect diagnostic. Skip it and
+            # continue indexing the remaining receipts so the
+            # operator still sees the evidence_bundles that are
+            # actually readable under $HOME.
+            continue
+        bundles.append(
+            {
+                "run_id": run_id,
+                "receipt_path": str(receipt_path),
+                "summary_path": str(
+                    receipt_path.parent / str(summary_ref)
+                ),
+                "run_type": receipt.get("run_type"),
+                "status": receipt.get("status"),
+                "summary_ref": summary_ref,
+                "trajectory_digest_ref": receipt.get(
+                    "trajectory_digest_ref", "trajectory-digest.json"
+                ),
+            }
+        )
+    return bundles
+
+
+def _resolve_current_best_revision_id(
+    state_current_best_revision: Any,
+    decisions: list[dict[str, Any]],
+) -> str | None:
+    if isinstance(state_current_best_revision, str) and state_current_best_revision:
+        return state_current_best_revision
+    best_revision_id: str | None = None
+    for decision in decisions:
+        accepted = (
+            decision.get("accepted") is True
+            or decision.get("event") == "optimize_accepted"
+        )
+        revision_id = decision.get("revision_id")
+        if accepted and isinstance(revision_id, str) and revision_id:
+            best_revision_id = revision_id
+    return best_revision_id
+
+
 def build_inspect_payload(target: Path) -> dict[str, Any]:
     artifact, workspace = resolve_inspect_paths(target)
     state = _load_json(workspace / "state.json")
@@ -115,12 +168,17 @@ def build_inspect_payload(target: Path) -> dict[str, Any]:
         for record in history
         if (projected := _project_acceptance_decision(record)) is not None
     ]
-    return {
+    evidence_bundles = _load_evidence_bundles()
+    payload = {
         "artifact_path": str(artifact),
         "workspace_path": str(workspace),
         "envelope_status": envelope.get("status"),
-        "current_best_revision_id": state.get("current_best_revision"),
+        "current_best_revision_id": _resolve_current_best_revision_id(
+            state.get("current_best_revision"),
+            decisions,
+        ),
         "revision_history": revisions,
         "acceptance_decisions": decisions,
-        "evidence_bundles": [],
+        "evidence_bundles": evidence_bundles,
     }
+    return payload
