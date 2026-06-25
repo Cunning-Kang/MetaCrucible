@@ -29,6 +29,19 @@ The module exposes:
   - :func:`build_evidence_summary` — collapse the run record into a
     small dict the smoke pass and the optimizer pipeline can branch
     on.
+  - :func:`build_subagent_preflight_argv` — pure argv builder for the
+    subagent path (Issue #46 Task 2). Emits
+    ``[<binary>, --bare, --agents <inline_json>, -p, --output-format stream-json]``
+    so the materialized ``agents.json`` content is passed inline
+    (the current ``claude`` runtime does not accept a file path on
+    ``--agents``).
+  - :func:`run_subagent_preflight` — the **one** subprocess execution
+    method for the subagent path. Reads the materialized
+    ``agents.json``, feeds its content inline as the ``--agents``
+    flag value, parses stream-json stdout through
+    :func:`metacrucible.claude_stream_json.parse_stream_json`, and
+    folds the final output through
+    :func:`metacrucible.preflight.check_subagent_preflight`.
 
 The harness is intentionally thin: no provider SDK, no shell string,
 no shell metachar quoting. Subprocess is confined to a single method;
@@ -46,7 +59,12 @@ from typing import Any, Mapping, Sequence
 
 from .argv_normalize import REVIEWED_TOOL_NAMES
 from .claude_stream_json import ADAPTER_VERSION, parse_stream_json
-from .preflight import check_skill_preflight, skill_preflight_prompt
+from .preflight import (
+    check_skill_preflight,
+    check_subagent_preflight,
+    skill_preflight_prompt,
+    subagent_preflight_prompt,
+)
 
 __all__ = [
     "SKILL_FILENAME",
@@ -64,9 +82,12 @@ __all__ = [
     "SKILL_MATERIALIZE_WRITE_FAILED_BLOCKER",
     "SkillMaterialization",
     "SkillPreflightRun",
+    "SubagentPreflightRun",
     "materialize_skill",
     "build_skill_preflight_argv",
     "run_skill_preflight",
+    "build_subagent_preflight_argv",
+    "run_subagent_preflight",
     "build_evidence_summary",
 ]
 
@@ -185,6 +206,28 @@ class SkillPreflightRun:
     stderr: str = ""
     evidence: dict[str, Any] = field(default_factory=dict)
     preflight: dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class SubagentPreflightRun:
+    """Result of a single ``run_subagent_preflight`` invocation.
+
+    Mirrors :class:`SkillPreflightRun` for the subagent path. ``argv``
+    is the full token list the harness executed; ``evidence`` is the
+    parse-stream-json evidence dict; ``preflight`` is the
+    :func:`metacrucible.preflight.check_subagent_preflight` result
+    applied to ``evidence["final_output"]``. ``agents_path`` is the
+    materialized ``--agents`` JSON file the harness loaded (verbatim,
+    for evidence dumps).
+    """
+
+    argv: list[str] = field(default_factory=list)
+    exit_code: int = -1
+    stdout: str = ""
+    stderr: str = ""
+    evidence: dict[str, Any] = field(default_factory=dict)
+    preflight: dict[str, Any] = field(default_factory=dict)
+    agents_path: str = ""
+
 
 
 # --------------------------------------------------------------------------- #
@@ -395,6 +438,76 @@ def build_skill_preflight_argv(
 
 
 # --------------------------------------------------------------------------- #
+# Pure: argv builder (subagent)                                               #
+# --------------------------------------------------------------------------- #
+
+
+def build_subagent_preflight_argv(
+    *,
+    agents_json: str,
+    binary: str = DEFAULT_BINARY,
+    permission_mode: str = DEFAULT_PERMISSION_MODE,
+    output_format: str = DEFAULT_OUTPUT_FORMAT,
+) -> list[str]:
+    """Build the canonical subagent preflight argv (pure, no subprocess).
+
+    The token shape is the subagent-side mirror of
+    :func:`build_skill_preflight_argv` (ADR 0028):
+
+        <binary>
+        --bare
+        --agents <inline_json>
+        -p
+        --output-format <output_format>
+
+    Notes
+    -----
+    - ``--agents`` accepts **inline JSON only** on the current
+      ``claude`` runtime (``--help`` documents ``--agents <json>`` as
+      "JSON object defining custom agents"). Empirically, ``claude
+      --agents <file_path>`` is silently dropped — the file is not
+      loaded and the agent does not appear in the init event. The
+      harness therefore reads the materialized ``agents.json`` and
+      passes its UTF-8 content as the flag value. This builder takes
+      the JSON literal so it stays a pure function of its inputs;
+      :func:`run_subagent_preflight` does the file read.
+    - ``--verbose`` is intentionally absent: the documented
+      ``--output-format stream-json`` argv does not require it for
+      shape; the subprocess method injects it only because the
+      current ``claude`` runtime aborts without it (same rationale
+      as the Skill path).
+    - The preflight prompt is *not* included; callers (specifically
+      :func:`run_subagent_preflight`) append it as the final
+      positional argument so this builder stays a pure function of
+      its inputs.
+    - ``--allowed-tools`` / ``--add-dir`` are not on this argv:
+      subagent injection loads the agent JSON, not a Skill tree, and
+      the brief pins the minimal token shape. Tool allowlisting for
+      execution evaluation is layered on top by callers (Task 4).
+    """
+    if not isinstance(binary, str) or not binary:
+        raise ValueError("binary must be a non-empty string")
+    if not isinstance(permission_mode, str) or not permission_mode:
+        raise ValueError("permission_mode must be a non-empty string")
+    if not isinstance(output_format, str) or not output_format:
+        raise ValueError("output_format must be a non-empty string")
+    if not isinstance(agents_json, str) or not agents_json:
+        raise ValueError("agents_json must be a non-empty JSON string")
+
+    argv: list[str] = [
+        binary,
+        "--bare",
+        "--agents",
+        agents_json,
+        "-p",
+        "--output-format",
+        output_format,
+    ]
+    return argv
+
+
+
+# --------------------------------------------------------------------------- #
 # Pure: result-shape helper                                                   #
 # --------------------------------------------------------------------------- #
 
@@ -571,6 +684,185 @@ def run_skill_preflight(
         evidence=evidence,
         preflight=preflight,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Subprocess: the ONE method (subagent)                                       #
+# --------------------------------------------------------------------------- #
+
+
+def run_subagent_preflight(
+    *,
+    agents_path: str | os.PathLike[str],
+    binary: str = DEFAULT_BINARY,
+    permission_mode: str = DEFAULT_PERMISSION_MODE,
+    output_format: str = DEFAULT_OUTPUT_FORMAT,
+    subagent_name: str = "",
+    prompt: str | None = None,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    env: Mapping[str, str] | None = None,
+    cwd: str | os.PathLike[str] | None = None,
+    verbose: bool = DEFAULT_VERBOSE_FLAG,
+    run_subprocess: Any = None,
+) -> SubagentPreflightRun:
+    """Spawn the binary once with ``--agents <inline_json>`` and parse stream-json.
+
+    Subagent-side mirror of :func:`run_skill_preflight`. This is
+    the **only** subprocess execution method for the subagent path.
+    Everything else in :mod:`metacrucible.adapter_runtime` is pure
+    and unit-testable without a real binary.
+
+    Flow
+    -----
+    1. Read ``agents_path`` (the materialized file written by
+       :func:`metacrucible.subagent_injection.materialize_subagent`)
+       and pass its UTF-8 content inline as the ``--agents`` flag
+       value. The current ``claude`` runtime does not accept a file
+       path on ``--agents``; see
+       :func:`build_subagent_preflight_argv` for the empirical
+       verification.
+    2. Build the argv from
+       :func:`build_subagent_preflight_argv`, inject ``--verbose``
+       immediately before ``-p`` (runtime requirement for
+       ``-p --output-format stream-json``), and append the
+       preflight prompt as the final positional argument.
+    3. Spawn the binary via :func:`subprocess.run` (or the caller-
+       supplied ``run_subprocess`` test seam) with
+       ``capture_output=True, text=True, timeout=timeout, check=False``.
+    4. Parse stdout through
+       :func:`metacrucible.claude_stream_json.parse_stream_json`
+       (existing parser; no parallel implementation).
+    5. Fold ``evidence["final_output"]`` through
+       :func:`metacrucible.preflight.check_subagent_preflight`.
+
+    Parameters
+    ----------
+    agents_path:
+        Materialized ``--agents`` JSON file (typically the
+        ``agents_path`` returned by
+        :func:`metacrucible.subagent_injection.materialize_subagent`).
+        Read once and passed inline as the ``--agents`` flag value.
+    binary:
+        Runtime binary name. Defaults to ``"claude"``; Task 3 passes
+        ``"omp"`` to drive oh-my-pi through the same harness.
+    permission_mode:
+        ``--permission-mode`` value. Defaults to ``"default"`` so the
+        runtime's own permission policy is in effect.
+    output_format:
+        ``--output-format`` value. Defaults to ``"stream-json"``;
+        only that format is parseable by
+        :func:`metacrucible.claude_stream_json.parse_stream_json`.
+    subagent_name:
+        Optional subagent name to fold into the preflight prompt
+        when ``prompt`` is not supplied.
+    prompt:
+        Explicit prompt override. When ``None`` (the default), the
+        preflight prompt is built via
+        :func:`metacrucible.preflight.subagent_preflight_prompt`.
+    timeout:
+        Subprocess timeout in seconds. ``0`` disables the timeout.
+    env:
+        Optional environment override. ``None`` inherits the parent
+        environment (the runtime still needs auth from the OS
+        keychain / subscription, never from a provider API key in
+        this harness).
+    cwd:
+        Optional working directory override. ``None`` inherits the
+        caller's cwd.
+    verbose:
+        Inject ``--verbose`` before ``-p`` (default ``True``). The
+        current ``claude`` runtime aborts ``--print --output-format
+        stream-json`` without it.
+    run_subprocess:
+        Test seam. When supplied, the harness calls it as
+        ``run_subprocess(full_argv, ...)`` and expects a
+        ``subprocess.CompletedProcess``-like object. Production
+        callers leave this ``None``.
+    """
+    path = _coerce_path(agents_path)
+
+    try:
+        agents_json = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        # Mirror the "missing file" branch of
+        # verify_subagent_injection so the smoke pass can chain the
+        # two without reshaping the result dict.
+        stderr = f"failed to read materialized agents.json at {path}: {exc}"
+        evidence = parse_stream_json(
+            "",
+            adapter_version=ADAPTER_VERSION,
+            exit_code=-1,
+            stderr=stderr,
+        )
+        return SubagentPreflightRun(
+            argv=[],
+            exit_code=-1,
+            stderr=stderr,
+            evidence=evidence,
+            preflight=check_subagent_preflight(""),
+            agents_path=str(path),
+        )
+
+    if prompt is None:
+        prompt = subagent_preflight_prompt(subagent_name=subagent_name)
+
+    base_argv = build_subagent_preflight_argv(
+        agents_json=agents_json,
+        binary=binary,
+        permission_mode=permission_mode,
+        output_format=output_format,
+    )
+    # Insert --verbose immediately before -p so the spec argv shape
+    # is preserved (the brief's token list is reproduced exactly
+    # minus the verbose flag, which is a runtime requirement rather
+    # than a contract one).
+    full_argv: list[str] = []
+    inserted_verbose = False
+    for token in base_argv:
+        if not inserted_verbose and token == "-p" and verbose:
+            full_argv.append("--verbose")
+            inserted_verbose = True
+        full_argv.append(token)
+    if verbose and not inserted_verbose:
+        # ``-p`` was not in the argv (defensive): fall back to
+        # appending --verbose before the prompt.
+        full_argv.append("--verbose")
+    full_argv.append(prompt)
+
+    runner = run_subprocess if run_subprocess is not None else subprocess.run
+    completed = runner(
+        full_argv,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
+        cwd=cwd,
+        check=False,
+    )
+
+    stdout = getattr(completed, "stdout", "") or ""
+    stderr = getattr(completed, "stderr", "") or ""
+    exit_code = int(getattr(completed, "returncode", -1))
+
+    evidence = parse_stream_json(
+        stdout,
+        adapter_version=ADAPTER_VERSION,
+        exit_code=exit_code,
+        stderr=stderr,
+    )
+    final_output = evidence.get("final_output") or ""
+    preflight = check_subagent_preflight(final_output)
+
+    return SubagentPreflightRun(
+        argv=list(full_argv),
+        exit_code=exit_code,
+        stdout=stdout,
+        stderr=stderr,
+        evidence=evidence,
+        preflight=preflight,
+        agents_path=str(path),
+    )
+
 
 
 # --------------------------------------------------------------------------- #

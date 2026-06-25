@@ -718,3 +718,436 @@ def _which(name: str) -> str | None:
     import shutil
 
     return shutil.which(name)
+
+
+# --------------------------------------------------------------------------- #
+# Subagent argv builder + result shape (Issue #46 Task 2)                     #
+# --------------------------------------------------------------------------- #
+#
+# The subagent path is the mirror of the Skill path: a pure argv builder
+# + a single subprocess method that reads the materialized ``agents.json``
+# and passes its content inline as the ``--agents`` flag value. The
+# current ``claude`` runtime does not accept a file path on ``--agents``;
+# the empirical verification is recorded in
+# :func:`metacrucible.adapter_runtime.build_subagent_preflight_argv`.
+
+# Minimal, deterministic subagent JSON used as the builder input. It is
+# inline (a string), not a file path, because the harness only emits
+# the inline shape.
+SUBAGENT_INLINE_JSON: str = (
+    '{"smoke-agent": {"description": "smoke subagent", '
+    '"prompt": "emit sentinel"}}'
+)
+
+# Exact token shape the brief pins (the ``--verbose`` runtime flag is
+# injected by the subprocess method, not by the pure builder).
+EXPECTED_SUBAGENT_ARGV_TOKENS_DEFAULT: list[str] = [
+    "claude",
+    "--bare",
+    "--agents",
+    SUBAGENT_INLINE_JSON,
+    "-p",
+    "--output-format",
+    "stream-json",
+]
+
+
+def test_adapter_module_exposes_build_subagent_preflight_argv(
+    adapter: Any,
+) -> None:
+    """The harness must expose the pure subagent argv builder."""
+    assert hasattr(adapter, "build_subagent_preflight_argv")
+    assert callable(adapter.build_subagent_preflight_argv)
+
+
+def test_adapter_module_exposes_run_subagent_preflight(adapter: Any) -> None:
+    """The harness must expose the subagent subprocess method."""
+    assert hasattr(adapter, "run_subagent_preflight")
+    assert callable(adapter.run_subagent_preflight)
+
+
+def test_adapter_module_exposes_subagent_preflight_run_dataclass(
+    adapter: Any,
+) -> None:
+    """The harness must expose the :class:`SubagentPreflightRun` dataclass."""
+    assert hasattr(adapter, "SubagentPreflightRun")
+    field_names = set(adapter.SubagentPreflightRun.__dataclass_fields__.keys())
+    # The result must surface every artifact the smoke pass writes.
+    assert {
+        "argv",
+        "exit_code",
+        "stdout",
+        "stderr",
+        "evidence",
+        "preflight",
+        "agents_path",
+    }.issubset(field_names)
+
+
+# --- argv builder shape ----------------------------------------------------- #
+
+
+def test_build_subagent_argv_matches_brief_token_shape(adapter: Any) -> None:
+    """The builder must emit the exact tokens the brief pins."""
+    argv = adapter.build_subagent_preflight_argv(agents_json=SUBAGENT_INLINE_JSON)
+    assert argv == EXPECTED_SUBAGENT_ARGV_TOKENS_DEFAULT
+
+
+def test_build_subagent_argv_default_binary_is_claude(adapter: Any) -> None:
+    """The default binary must be ``claude`` (Task 3 will override to ``omp``)."""
+    argv = adapter.build_subagent_preflight_argv(agents_json=SUBAGENT_INLINE_JSON)
+    assert argv[0] == "claude"
+
+
+def test_build_subagent_argv_honors_binary_parameter(adapter: Any) -> None:
+    """The builder must allow a custom binary name for Task 3 (oh-my-pi)."""
+    argv = adapter.build_subagent_preflight_argv(
+        agents_json=SUBAGENT_INLINE_JSON,
+        binary="omp",
+    )
+    assert argv[0] == "omp"
+    # The rest of the token shape must be byte-for-byte identical.
+    assert argv[1:] == EXPECTED_SUBAGENT_ARGV_TOKENS_DEFAULT[1:]
+
+
+def test_build_subagent_argv_passes_agents_json_inline(adapter: Any) -> None:
+    """The ``--agents`` flag value must be the inline JSON literal (not a path)."""
+    argv = adapter.build_subagent_preflight_argv(agents_json=SUBAGENT_INLINE_JSON)
+    agents_idx = argv.index("--agents")
+    assert argv[agents_idx + 1] == SUBAGENT_INLINE_JSON
+    assert argv[agents_idx + 1].startswith("{")
+    assert argv[agents_idx + 1].endswith("}")
+
+
+def test_build_subagent_argv_uses_bare_flag(adapter: Any) -> None:
+    """``--bare`` must be the second token (ADR 0028)."""
+    argv = adapter.build_subagent_preflight_argv(agents_json=SUBAGENT_INLINE_JSON)
+    assert argv.index("--bare") == 1
+
+
+def test_build_subagent_argv_uses_print_flag(adapter: Any) -> None:
+    """``-p`` must be present for non-interactive mode."""
+    argv = adapter.build_subagent_preflight_argv(agents_json=SUBAGENT_INLINE_JSON)
+    assert "-p" in argv
+
+
+def test_build_subagent_argv_uses_stream_json_output(adapter: Any) -> None:
+    """``--output-format stream-json`` must be the documented format."""
+    argv = adapter.build_subagent_preflight_argv(agents_json=SUBAGENT_INLINE_JSON)
+    idx = argv.index("--output-format")
+    assert argv[idx + 1] == "stream-json"
+
+
+def test_build_subagent_argv_does_not_include_verbose(adapter: Any) -> None:
+    """``--verbose`` is a runtime requirement; the pure builder must omit it."""
+    argv = adapter.build_subagent_preflight_argv(agents_json=SUBAGENT_INLINE_JSON)
+    assert "--verbose" not in argv
+
+
+def test_build_subagent_argv_rejects_empty_binary(adapter: Any) -> None:
+    """An empty binary name must fail loudly."""
+    with pytest.raises(ValueError):
+        adapter.build_subagent_preflight_argv(
+            agents_json=SUBAGENT_INLINE_JSON,
+            binary="",
+        )
+
+
+def test_build_subagent_argv_rejects_empty_permission_mode(adapter: Any) -> None:
+    """An empty permission mode must fail loudly."""
+    with pytest.raises(ValueError):
+        adapter.build_subagent_preflight_argv(
+            agents_json=SUBAGENT_INLINE_JSON,
+            permission_mode="",
+        )
+
+
+def test_build_subagent_argv_rejects_empty_output_format(adapter: Any) -> None:
+    """An empty output format must fail loudly."""
+    with pytest.raises(ValueError):
+        adapter.build_subagent_preflight_argv(
+            agents_json=SUBAGENT_INLINE_JSON,
+            output_format="",
+        )
+
+
+def test_build_subagent_argv_rejects_empty_agents_json(adapter: Any) -> None:
+    """An empty ``agents_json`` must fail loudly."""
+    with pytest.raises(ValueError):
+        adapter.build_subagent_preflight_argv(agents_json="")
+
+
+def test_build_subagent_argv_rejects_non_string_agents_json(adapter: Any) -> None:
+    """A non-string ``agents_json`` must fail loudly."""
+    with pytest.raises(ValueError):
+        adapter.build_subagent_preflight_argv(agents_json=123)  # type: ignore[arg-type]
+
+
+# --- subprocess method via test seam ---------------------------------------- #
+
+
+def _write_agents_json(path: Path) -> None:
+    """Write a minimal ``agents.json`` file at ``path`` for the subprocess tests."""
+    path.write_text(SUBAGENT_INLINE_JSON, encoding="utf-8")
+
+
+def test_run_subagent_preflight_passes_subagent_preflight_prompt(
+    adapter: Any, preflight: Any, tmp_path: Path
+) -> None:
+    """The harness must feed the subagent preflight prompt as final positional."""
+    agents_path = tmp_path / "agents.json"
+    _write_agents_json(agents_path)
+    runner = _make_fake_runner(stdout="not-json\n", stderr="", returncode=0)
+    adapter.run_subagent_preflight(
+        agents_path=agents_path,
+        run_subprocess=runner,
+        subagent_name="smoke-agent",
+    )
+    full_argv = runner.calls[0]["argv"]  # type: ignore[attr-defined]
+    expected_prompt = preflight.subagent_preflight_prompt(subagent_name="smoke-agent")
+    assert full_argv[-1] == expected_prompt
+    assert expected_prompt.startswith("You are running the MetaCrucible")
+
+
+def test_run_subagent_preflight_injects_verbose_flag(
+    adapter: Any, tmp_path: Path
+) -> None:
+    """``--verbose`` must be inserted immediately before ``-p``."""
+    agents_path = tmp_path / "agents.json"
+    _write_agents_json(agents_path)
+    runner = _make_fake_runner(stdout="not-json\n", stderr="", returncode=0)
+    adapter.run_subagent_preflight(
+        agents_path=agents_path,
+        run_subprocess=runner,
+    )
+    full_argv = runner.calls[0]["argv"]  # type: ignore[attr-defined]
+    p_idx = full_argv.index("-p")
+    assert full_argv[p_idx - 1] == "--verbose"
+
+
+def test_run_subagent_preflight_reads_agents_json_path(
+    adapter: Any, tmp_path: Path
+) -> None:
+    """The harness must read the materialized ``agents.json`` from disk."""
+    agents_path = tmp_path / "agents.json"
+    _write_agents_json(agents_path)
+    runner = _make_fake_runner(stdout="not-json\n", stderr="", returncode=0)
+    adapter.run_subagent_preflight(
+        agents_path=agents_path,
+        run_subprocess=runner,
+    )
+    full_argv = runner.calls[0]["argv"]  # type: ignore[attr-defined]
+    agents_idx = full_argv.index("--agents")
+    # The flag value must be the file contents, verbatim, not the path.
+    assert full_argv[agents_idx + 1] == SUBAGENT_INLINE_JSON
+    assert full_argv[agents_idx + 1] != str(agents_path)
+
+
+def test_run_subagent_preflight_uses_capture_output(
+    adapter: Any, tmp_path: Path
+) -> None:
+    """The harness must request captured stdout/stderr from the runner."""
+    agents_path = tmp_path / "agents.json"
+    _write_agents_json(agents_path)
+    runner = _make_fake_runner(stdout="not-json\n", stderr="", returncode=0)
+    adapter.run_subagent_preflight(
+        agents_path=agents_path,
+        run_subprocess=runner,
+    )
+    kwargs = runner.calls[0]["kwargs"]  # type: ignore[attr-defined]
+    assert kwargs.get("capture_output") is True
+    assert kwargs.get("text") is True
+    assert kwargs.get("check") is False
+
+
+def test_run_subagent_preflight_passes_timeout(
+    adapter: Any, tmp_path: Path
+) -> None:
+    """The harness must forward a timeout to the runner."""
+    agents_path = tmp_path / "agents.json"
+    _write_agents_json(agents_path)
+    runner = _make_fake_runner(stdout="not-json\n", stderr="", returncode=0)
+    adapter.run_subagent_preflight(
+        agents_path=agents_path,
+        run_subprocess=runner,
+        timeout=7.5,
+    )
+    kwargs = runner.calls[0]["kwargs"]  # type: ignore[attr-defined]
+    assert kwargs.get("timeout") == 7.5
+
+
+def test_run_subagent_preflight_parses_stream_json_through_existing_parser(
+    adapter: Any, stream_json: Any, tmp_path: Path
+) -> None:
+    """The harness must reuse ``parse_stream_json`` (no parallel parser)."""
+    agents_path = tmp_path / "agents.json"
+    _write_agents_json(agents_path)
+    stdout = (
+        '{"type":"system","subtype":"init","claude_code_version":"0.4.1"}\n'
+        '{"type":"result","subtype":"success","result":"hello"}\n'
+    )
+    runner = _make_fake_runner(stdout=stdout, stderr="", returncode=0)
+    run = adapter.run_subagent_preflight(
+        agents_path=agents_path,
+        run_subprocess=runner,
+    )
+    evidence = run.evidence
+    assert evidence["start_captured"] is True
+    assert evidence["completion_captured"] is True
+    assert evidence["adapter_version"] == stream_json.ADAPTER_VERSION
+    assert evidence["claude_code_version"] == "0.4.1"
+
+
+def test_run_subagent_preflight_folds_final_output_through_check_subagent_preflight(
+    adapter: Any, preflight: Any, tmp_path: Path
+) -> None:
+    """The harness must reuse ``check_subagent_preflight`` (no parallel validator)."""
+    agents_path = tmp_path / "agents.json"
+    _write_agents_json(agents_path)
+    sentinel = (
+        f"{preflight.SUBAGENT_SENTINEL_PREFIX}=yes; NAME=smoke-agent"
+    )
+    stdout = (
+        '{"type":"system","subtype":"init","claude_code_version":"0.4.1"}\n'
+        f'{{"type":"result","subtype":"success","result":"{sentinel}"}}\n'
+    )
+    runner = _make_fake_runner(stdout=stdout, stderr="", returncode=0)
+    run = adapter.run_subagent_preflight(
+        agents_path=agents_path,
+        run_subprocess=runner,
+    )
+    expected = preflight.check_subagent_preflight(sentinel)
+    assert run.preflight == expected
+    assert run.preflight.get("ok") is True
+    assert run.preflight.get("discoverable") == "yes"
+    assert run.preflight.get("name") == "smoke-agent"
+
+
+def test_run_subagent_preflight_propagates_exit_code(
+    adapter: Any, tmp_path: Path
+) -> None:
+    """The harness must surface the subprocess exit code verbatim."""
+    agents_path = tmp_path / "agents.json"
+    _write_agents_json(agents_path)
+    runner = _make_fake_runner(stdout="", stderr="boom", returncode=42)
+    run = adapter.run_subagent_preflight(
+        agents_path=agents_path,
+        run_subprocess=runner,
+    )
+    assert run.exit_code == 42
+    assert run.stderr == "boom"
+
+
+def test_run_subagent_preflight_captures_raw_stdout(
+    adapter: Any, tmp_path: Path
+) -> None:
+    """The harness must capture the raw stdout for evidence writes."""
+    agents_path = tmp_path / "agents.json"
+    _write_agents_json(agents_path)
+    stdout_blob = (
+        '{"type":"system","subtype":"init","claude_code_version":"0.4.1"}\n'
+    )
+    runner = _make_fake_runner(stdout=stdout_blob, stderr="", returncode=0)
+    run = adapter.run_subagent_preflight(
+        agents_path=agents_path,
+        run_subprocess=runner,
+    )
+    assert run.stdout == stdout_blob
+
+
+def test_run_subagent_preflight_honors_explicit_prompt(
+    adapter: Any, tmp_path: Path
+) -> None:
+    """An explicit prompt override must be appended verbatim."""
+    agents_path = tmp_path / "agents.json"
+    _write_agents_json(agents_path)
+    runner = _make_fake_runner(stdout="not-json\n", stderr="", returncode=0)
+    adapter.run_subagent_preflight(
+        agents_path=agents_path,
+        run_subprocess=runner,
+        prompt="CUSTOM PROMPT",
+    )
+    full_argv = runner.calls[0]["argv"]  # type: ignore[attr-defined]
+    assert full_argv[-1] == "CUSTOM PROMPT"
+
+
+def test_run_subagent_preflight_default_prompt_uses_subagent_name(
+    adapter: Any, preflight: Any, tmp_path: Path
+) -> None:
+    """The default prompt must fold the caller-supplied subagent name in."""
+    agents_path = tmp_path / "agents.json"
+    _write_agents_json(agents_path)
+    runner = _make_fake_runner(stdout="not-json\n", stderr="", returncode=0)
+    adapter.run_subagent_preflight(
+        agents_path=agents_path,
+        run_subprocess=runner,
+        subagent_name="my-agent",
+    )
+    full_argv = runner.calls[0]["argv"]  # type: ignore[attr-defined]
+    expected = preflight.subagent_preflight_prompt(subagent_name="my-agent")
+    assert full_argv[-1] == expected
+
+
+def test_run_subagent_preflight_disable_verbose(
+    adapter: Any, tmp_path: Path
+) -> None:
+    """Setting ``verbose=False`` must drop the ``--verbose`` injection."""
+    agents_path = tmp_path / "agents.json"
+    _write_agents_json(agents_path)
+    runner = _make_fake_runner(stdout="not-json\n", stderr="", returncode=0)
+    adapter.run_subagent_preflight(
+        agents_path=agents_path,
+        run_subprocess=runner,
+        verbose=False,
+    )
+    full_argv = runner.calls[0]["argv"]  # type: ignore[attr-defined]
+    assert "--verbose" not in full_argv
+
+
+def test_run_subagent_preflight_records_agents_path(
+    adapter: Any, tmp_path: Path
+) -> None:
+    """The result must surface the materialized ``agents.json`` path verbatim."""
+    agents_path = tmp_path / "agents.json"
+    _write_agents_json(agents_path)
+    runner = _make_fake_runner(stdout="not-json\n", stderr="", returncode=0)
+    run = adapter.run_subagent_preflight(
+        agents_path=agents_path,
+        run_subprocess=runner,
+    )
+    assert run.agents_path == str(agents_path)
+
+
+def test_run_subagent_preflight_blocks_on_missing_file(adapter: Any) -> None:
+    """A missing ``agents.json`` must surface a clear blocker, not crash."""
+    missing = Path("/nonexistent/path/does/not/exist/agents.json")
+    runner = _make_fake_runner(stdout="not-json\n", stderr="", returncode=0)
+    run = adapter.run_subagent_preflight(
+        agents_path=missing,
+        run_subprocess=runner,
+    )
+    # No subprocess should have been spawned when the file is missing.
+    assert runner.calls == []  # type: ignore[attr-defined]
+    assert run.agents_path == str(missing)
+    assert run.exit_code == -1
+    assert "failed to read materialized agents.json" in run.stderr
+
+
+def test_run_subagent_preflight_argv_does_not_include_subprocess_seam(
+    adapter: Any, tmp_path: Path
+) -> None:
+    """The recorded ``argv`` is what would be spawned; no test-only artifacts."""
+    agents_path = tmp_path / "agents.json"
+    _write_agents_json(agents_path)
+    runner = _make_fake_runner(stdout="not-json\n", stderr="", returncode=0)
+    run = adapter.run_subagent_preflight(
+        agents_path=agents_path,
+        run_subprocess=runner,
+    )
+    # The pure builder emits 7 tokens; the runner appends --verbose and
+    # the prompt, so the final argv must be 9 tokens (not 11+, which
+    # would mean a fake-kwargs leak).
+    assert len(run.argv) == 9
+    assert run.argv[0] == "claude"
+    assert run.argv[-1].startswith("You are running the MetaCrucible")
+

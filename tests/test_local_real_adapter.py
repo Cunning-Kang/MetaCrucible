@@ -107,6 +107,15 @@ def stream_json() -> Any:
     return importlib.import_module(STREAM_JSON_MODULE)
 
 
+@pytest.fixture(scope="module")
+def parser() -> Any:
+    """Import the capability artifact parser (Issue #4)."""
+    import importlib
+
+    return importlib.import_module("metacrucible.artifact")
+
+
+
 @pytest.fixture
 def skip_unless_local_real() -> None:
     """Skip when the env gate is unset."""
@@ -278,6 +287,226 @@ def test_local_real_skill_discovery_never_touches_user_home(
         assert not skill_in_fake_home.exists(), (
             f"local-real run wrote to user-home layout at {skill_in_fake_home}"
         )
+
+# --------------------------------------------------------------------------- #
+# Subagent injection smoke (Issue #46 Task 2)                                 #
+# --------------------------------------------------------------------------- #
+
+#: Minimal, deterministic subagent source for the local-real smoke. The
+#: frontmatter carries a routing-safe name and description; the body
+#: primes the model to emit the subagent preflight sentinel (ADR 0028,
+#: Issue #9 AC3).
+SMOKE_SUBAGENT_SOURCE: str = (
+    "---\n"
+    "name: metacrucible-smoke-subagent\n"
+    "description: MetaCrucible local-real smoke subagent (Issue #46 Task 2).\n"
+    "tools:\n"
+    "  - Read\n"
+    "systemPrompt: |\n"
+    "  You are the MetaCrucible local-real smoke subagent.\n"
+    "  When asked to run the MetaCrucible preflight, reply with\n"
+    "  exactly one line in the format the prompt specifies, and\n"
+    "  nothing else.\n"
+    "---\n"
+)
+
+
+def test_local_real_subagent_injection_via_claude(
+    adapter: Any,
+    preflight: Any,
+    stream_json: Any,
+    parser: Any,
+    skip_unless_local_real: None,
+    skip_unless_claude_present: None,
+    tmp_path: Path,
+) -> None:
+    """End-to-end: materialize subagent, invoke real ``claude``, assert discoverable.
+
+    Mirrors :func:`test_local_real_skill_discovery_via_claude` for the
+    subagent path (Issue #46 Task 2).
+
+    Steps
+    -----
+    1. Parse :data:`SMOKE_SUBAGENT_SOURCE` into a
+       :class:`metacrucible.artifact.SubagentArtifact` and materialize
+       it via :func:`metacrucible.subagent_injection.materialize_subagent`
+       into ``tmp_path``. The materializer writes
+       ``<tmp_path>/agents.json`` (the file the harness loads).
+    2. Verify the materialized file via
+       :func:`metacrucible.subagent_injection.verify_subagent_injection`
+       before the binary run — the harness must chain the existing
+       materializer + verifier without reimplementing either.
+    3. Call :func:`metacrucible.adapter_runtime.run_subagent_preflight`
+       with the resolved ``agents_path`` + subagent name.
+    4. Parse the captured stdout through
+       :func:`metacrucible.claude_stream_json.parse_stream_json`
+       (the harness does this; the test asserts the result).
+    5. Feed the final output through
+       :func:`metacrucible.preflight.check_subagent_preflight` and
+       assert the subagent is discoverable (no
+       ``subagent-preflight-*`` blockers).
+    6. Re-run :func:`verify_subagent_injection` after the binary run
+       to prove the file still passes the verifier (no runtime drift).
+
+    The test is honest: it does not silently weaken the assertion. If
+    the model fails to emit the sentinel, the test fails with a
+    captured evidence dump. If the runtime ignores the ``--agents``
+    payload, the ``init`` event exposes it and the test fails with
+    a clear ``start_captured`` / ``completion_captured`` mismatch.
+    """
+    import importlib
+
+    subagent_injection = importlib.import_module(
+        "metacrucible.subagent_injection"
+    )
+
+    artifact = parser.parse_subagent(SMOKE_SUBAGENT_SOURCE)
+    materialization = subagent_injection.materialize_subagent(
+        artifact, tmp_path
+    )
+    assert materialization.get("ok") is True, (
+        f"materialize_subagent failed: {materialization!r}"
+    )
+    agents_path = Path(materialization["agents_path"])
+    assert agents_path.is_file(), (
+        f"agents.json was not written; got path={agents_path!r}"
+    )
+    resolved_name = materialization["name"]
+    assert resolved_name == "metacrucible-smoke-subagent"
+
+    # Pre-run verifier pass: the materialized file must already pass.
+    pre_verify = subagent_injection.verify_subagent_injection(
+        agents_path,
+        expected_name=resolved_name,
+        expected_description=(
+            "MetaCrucible local-real smoke subagent (Issue #46 Task 2)."
+        ),
+    )
+    assert pre_verify.get("ok") is True, (
+        f"verify_subagent_injection rejected the materialization "
+        f"before the binary run: {pre_verify!r}"
+    )
+    assert _blocker_ids(pre_verify) == []
+
+    run = adapter.run_subagent_preflight(
+        agents_path=agents_path,
+        subagent_name=resolved_name,
+        cwd=tmp_path,
+        timeout=180.0,
+    )
+
+    # Write release-ready evidence to scratch so a developer can
+    # audit the run without re-invoking the binary.
+    evidence_dir = tmp_path / "evidence-subagent"
+    evidence_dir.mkdir(exist_ok=True)
+    (evidence_dir / "raw_stream.jsonl").write_text(
+        run.stdout, encoding="utf-8"
+    )
+    (evidence_dir / "stderr.txt").write_text(run.stderr, encoding="utf-8")
+    (evidence_dir / "evidence.json").write_text(
+        _dump_pretty(run.evidence), encoding="utf-8"
+    )
+    (evidence_dir / "preflight.json").write_text(
+        _dump_pretty(run.preflight), encoding="utf-8"
+    )
+    (evidence_dir / "argv.json").write_text(
+        _dump_pretty(run.argv), encoding="utf-8"
+    )
+
+    # First, the stream-json parser must classify the run as a clean
+    # Claude Code session (init + result present). If the runtime
+    # could not be reached, the test fails loudly here rather than
+    # hiding behind a sentinel-missing blocker.
+    evidence = run.evidence
+    assert evidence["start_captured"] is True, (
+        f"no system/init event in stream-json output; evidence: {evidence!r}"
+    )
+    assert evidence["completion_captured"] is True, (
+        f"no result event in stream-json output; evidence: {evidence!r}"
+    )
+    assert evidence["adapter_version"] == stream_json.ADAPTER_VERSION
+    assert evidence["claude_code_version"], (
+        f"missing claude_code_version; evidence: {evidence!r}"
+    )
+
+    # Next, the preflight sentinel must report discoverable.
+    preflight_result = run.preflight
+    assert preflight_result.get("ok") is True, (
+        f"check_subagent_preflight did not report discoverable; "
+        f"preflight={preflight_result!r}; "
+        f"final_output={evidence.get('final_output')!r}; "
+        f"stream-json blockers={_blocker_ids(evidence)}"
+    )
+    assert preflight_result.get("discoverable") == "yes"
+    assert preflight_result.get("name") == resolved_name
+    assert _blocker_ids(preflight_result) == []
+
+    # Finally, re-run the verifier post-run to prove the materialization
+    # still satisfies the routing-surface contract.
+    post_verify = subagent_injection.verify_subagent_injection(
+        agents_path,
+        expected_name=resolved_name,
+        expected_description=(
+            "MetaCrucible local-real smoke subagent (Issue #46 Task 2)."
+        ),
+    )
+    assert post_verify.get("ok") is True, (
+        f"verify_subagent_injection rejected the materialization "
+        f"after the binary run (runtime drift?): {post_verify!r}"
+    )
+    assert _blocker_ids(post_verify) == []
+
+
+def test_local_real_subagent_injection_never_touches_user_home(
+    adapter: Any,
+    parser: Any,
+    skip_unless_local_real: None,
+    skip_unless_claude_present: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The local-real subagent smoke must not write to the user's real home.
+
+    Mirrors :func:`test_local_real_skill_discovery_never_touches_user_home`
+    for the subagent path. Forces ``HOME``/``USERPROFILE`` to a fake
+    scratch and asserts the harness never wrote a ``.claude/agents/``
+    tree under it.
+    """
+    import importlib
+
+    subagent_injection = importlib.import_module(
+        "metacrucible.subagent_injection"
+    )
+
+    fake_home = tmp_path / "fake-home"
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+
+    artifact = parser.parse_subagent(SMOKE_SUBAGENT_SOURCE)
+    materialization = subagent_injection.materialize_subagent(
+        artifact, tmp_path
+    )
+    assert materialization.get("ok") is True
+
+    adapter.run_subagent_preflight(
+        agents_path=materialization["agents_path"],
+        subagent_name=materialization["name"],
+        cwd=tmp_path,
+        timeout=180.0,
+    )
+
+    # The fake home may have been created by the runtime's own
+    # keychain read, but it must not contain a
+    # ``.claude/agents/<name>`` tree that we wrote.
+    if fake_home.exists():
+        agents_in_fake_home = (
+            fake_home / ".claude" / "agents" / materialization["name"]
+        )
+        assert not agents_in_fake_home.exists(), (
+            f"local-real subagent run wrote to user-home layout at "
+            f"{agents_in_fake_home}"
+        )
+
 
 
 # --------------------------------------------------------------------------- #
