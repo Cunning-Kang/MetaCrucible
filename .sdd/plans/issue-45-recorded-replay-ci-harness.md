@@ -330,6 +330,6 @@ Integration fix:
   Status: none
   Commit: none
   Affected tasks: none
-Run Record: ready-for-pr
-Finish decision: open-pr
-PR URL: pending
+Run Record: .sdd/work/issue-45-recorded-replay-ci-harness/run-record.md
+Finish decision: blocked-on-push
+PR URL: pending (push blocked by GitHub OAuth scope guard; see run-record.md)
