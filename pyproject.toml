@@ -45,7 +45,7 @@ Issues = "https://github.com/Cunning-Kang/MetaCrucible/issues"
 metacrucible = "metacrucible.__main__:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "pytest-rerunfailures>=14"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/metacrucible"]

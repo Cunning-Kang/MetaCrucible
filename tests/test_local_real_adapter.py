@@ -142,7 +142,6 @@ def skip_unless_claude_present() -> None:
 
 
 def test_local_real_marker_is_registered() -> None:
-    """The ``local_real`` marker must be applied to this module."""
     # Sanity check: the test file is collected with the marker, so
     # ``pytest -m local_real`` (i.e. ``mise run test-local-real``)
     # selects these cases.
@@ -158,6 +157,7 @@ def test_local_real_marker_is_registered() -> None:
 # Local-real smoke                                                            #
 # --------------------------------------------------------------------------- #
 
+@pytest.mark.flaky(reruns=1, reruns_delay=2)
 
 def test_local_real_skill_discovery_via_claude(
     adapter: Any,
@@ -219,6 +219,15 @@ def test_local_real_skill_discovery_via_claude(
     )
     (evidence_dir / "preflight.json").write_text(
         _dump_pretty(run.preflight), encoding="utf-8"
+    )
+    _assert_evidence_present(
+        evidence_dir,
+        [
+            "raw_stream.jsonl",
+            "stderr.txt",
+            "evidence.json",
+            "preflight.json",
+        ],
     )
 
     # First, the stream-json parser must classify the run as a clean
@@ -317,6 +326,7 @@ SMOKE_SUBAGENT_SOURCE: str = (
     "---\n"
 )
 
+@pytest.mark.flaky(reruns=1, reruns_delay=2)
 
 def test_local_real_subagent_injection_via_claude(
     adapter: Any,
@@ -428,6 +438,16 @@ def test_local_real_subagent_injection_via_claude(
     )
     (evidence_dir / "argv.json").write_text(
         _dump_pretty(run.argv), encoding="utf-8"
+    )
+    _assert_evidence_present(
+        evidence_dir,
+        [
+            "raw_stream.jsonl",
+            "stderr.txt",
+            "evidence.json",
+            "preflight.json",
+            "argv.json",
+        ],
     )
 
     # First, the stream-json parser must classify the run as a clean
@@ -584,7 +604,7 @@ def skip_unless_omp_present() -> None:
 
 
 # --- Skill discovery via omp ----------------------------------------------- #
-
+@pytest.mark.flaky(reruns=1, reruns_delay=2)
 
 def test_local_real_skill_discovery_via_omp(
     adapter: Any,
@@ -652,6 +672,16 @@ def test_local_real_skill_discovery_via_omp(
     (evidence_dir / "argv.json").write_text(
         _dump_pretty(run.argv), encoding="utf-8"
     )
+    _assert_evidence_present(
+        evidence_dir,
+        [
+            "stdout.txt",
+            "stderr.txt",
+            "evidence.json",
+            "preflight.json",
+            "argv.json",
+        ],
+    )
 
     # The harness must NOT pipe stdout through parse_stream_json
     # (omp text mode is plain text); the evidence dict must carry
@@ -679,7 +709,7 @@ def test_local_real_skill_discovery_via_omp(
 
 
 # --- Subagent injection via omp -------------------------------------------- #
-
+@pytest.mark.flaky(reruns=1, reruns_delay=2)
 
 def test_local_real_subagent_injection_via_omp(
     adapter: Any,
@@ -786,6 +816,17 @@ def test_local_real_subagent_injection_via_omp(
     (evidence_dir / "agents_layout.json").write_text(
         _dump_pretty({"agents_path": run.agents_path}), encoding="utf-8"
     )
+    _assert_evidence_present(
+        evidence_dir,
+        [
+            "stdout.txt",
+            "stderr.txt",
+            "evidence.json",
+            "preflight.json",
+            "argv.json",
+            "agents_layout.json",
+        ],
+    )
 
     # The harness must surface runtime="omp" so callers can branch.
     assert run.runtime == "omp"
@@ -859,3 +900,46 @@ def _dump_pretty(payload: Any) -> str:
     import json
 
     return json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n"
+
+def _assert_evidence_present(
+    evidence_dir: Path, expected_files: list[str]
+) -> None:
+    """Assert the evidence directory + files are written.
+
+    Shared assertion for the four local-real smoke tests that spawn
+    a real runtime binary (see ``CONTRIBUTING.md`` layer 3 for the
+    evidence-ref discipline). Each test writes its evidence files
+    to ``tmp_path/evidence*/``; this helper guarantees:
+
+    - The evidence directory exists.
+    - Each file in ``expected_files`` is present (stream captures
+      like ``stdout.txt`` / ``stderr.txt`` may legitimately be
+      empty when the binary produces no output on that stream;
+      the structured JSON files always carry content because the
+      harness populates them from in-memory dicts).
+    - Structured JSON files (``evidence.json``, ``preflight.json``,
+      ``argv.json``, ``agents_layout.json``) are non-empty AND
+      parse as JSON.
+
+    The test owns ``tmp_path``; this helper does not touch user home.
+    """
+    import json
+
+    structured = {
+        "evidence.json",
+        "preflight.json",
+        "argv.json",
+        "agents_layout.json",
+    }
+
+    assert evidence_dir.is_dir(), (
+        f"evidence directory missing: {evidence_dir}"
+    )
+    for name in expected_files:
+        path = evidence_dir / name
+        assert path.is_file(), f"evidence file missing: {path}"
+        if name in structured:
+            assert path.stat().st_size > 0, (
+                f"structured evidence file empty: {path}"
+            )
+            json.loads(path.read_text(encoding="utf-8"))
