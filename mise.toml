@@ -31,3 +31,7 @@ run = "pytest -m local_real"
 [tasks.build]
 description = "Build wheel and sdist into dist/ (PyPI release artifact; see issue #48)"
 run = "uv build --wheel --sdist"
+
+[tasks.release-gate]
+description = "Validate pyproject.toml [project].version is a real release (not a placeholder) and CHANGELOG.md has a matching `## [<version>]` section; with --check-tag also requires the `v<version>` git tag (PyPI release gate; see issue #48)"
+run = "python scripts/release_gate.py"
