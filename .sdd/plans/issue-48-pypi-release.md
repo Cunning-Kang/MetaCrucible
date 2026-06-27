@@ -187,16 +187,16 @@ Non-goals:
 - Expected: all tests PASS, pinning the trigger shape, OIDC permission, absence of API tokens / live-LLM markers, and presence of `pypa/gh-action-pypi-publish`.
 
 ### Status
-Status: in-progress
-Task review: pending
-Spec verdict: pending
-Quality verdict: pending
+Status: pass
+Task review: pass
+Spec verdict: pass
+Quality verdict: pass
 Task review rounds: 0/3
-Task review report: none
+Task review report: .sdd/work/issue-48-pypi-release/task-003/task-review-report.json
 Task base: 30fa3529d253ffb36173ef7a800118c90bb7afaf
 Task head: 59ab1a7eea1a6fefab1b468130b9b7ba160089aa
 Work commits: 59ab1a7eea1a6fefab1b468130b9b7ba160089aa
-Accepted range: none
+Accepted range: 30fa3529d253ffb36173ef7a800118c90bb7afaf..59ab1a7eea1a6fefab1b468130b9b7ba160089aa
 
 ### Dispatch facts
 Implementer allowed edit scope:
