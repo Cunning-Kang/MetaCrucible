@@ -13,3 +13,8 @@ __pycache__/
 .claude/plans/
 .claude/agent-memory/
 .claude/worktrees/
+
+# SDD runtime artifacts: transient per-run state. Runtime Plan
+# (.sdd/plans/) is committed (authoritative per skill); all .sdd/work/
+# content (task packages, JSON reports, briefs, run record) is not.
+.sdd/work/
