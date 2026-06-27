@@ -193,7 +193,7 @@ Spec verdict: pending
 Quality verdict: pending
 Task review rounds: 0/3
 Task review report: none
-Task base: 0dcf886fee08f3382e40fc0b7f616f909f1b3ec0
+Task base: 362e6e1f6fbb1569259ebece2be29b7e23f11eb8
 Task head: none
 Work commits: none
 Accepted range: none
