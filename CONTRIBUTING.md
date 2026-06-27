@@ -175,7 +175,7 @@ The local-real smoke must not write to the user's real
   (`tests/test_local_real_adapter.py`)
 
 If a future regression causes the harness to write to user-home
-layout under `fake-home`, one of those tests fails loudly. 
+layout under `fake-home`, one of those tests fails loudly. Do not
 relax those assertions to "make CI green" — they are the boundary
 between the smoke suite and the user's real environment.
 
