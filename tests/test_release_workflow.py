@@ -163,27 +163,27 @@ def test_workflow_uses_mise_action() -> None:
 
 
 def test_workflow_pins_mise_action_major() -> None:
-    """The Mise action must be pinned to a major version like ``@v2``."""
+    """The Mise action must be pinned to a major version like ``@v4``."""
     text = _read_workflow()
     assert re.search(
         r"jdx/mise-action@v\d+",
         text,
-    ), "Mise action must be pinned to a major version (e.g. `@v2`)"
+    ), "Mise action must be pinned to a major version (e.g. `@v4`)"
 
 
 def test_workflow_pins_mise_version() -> None:
     """The Mise action must be pinned to a concrete Mise version, not ``latest``."""
     text = _read_workflow()
     assert re.search(
-        r"^\s*mise-version:\s*\S+\s*$",
+        r"^\s*version:\s*\"?\S+\"?\s*$",
         text,
         re.MULTILINE,
-    ), "release workflow must pin a concrete `mise-version`"
+    ), "release workflow must pin a concrete `version`"
     assert "latest" not in re.search(
-        r"^\s*mise-version:\s*\S+\s*$",
+        r"^\s*version:\s*\"?\S+\"?\s*$",
         text,
         re.MULTILINE,
-    ).group(0), "mise-version must not be `latest`"
+    ).group(0), "version must not be `latest`"
 
 
 def test_workflow_runs_mise_install() -> None:
