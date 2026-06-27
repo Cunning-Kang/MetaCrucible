@@ -11,7 +11,7 @@ Primary root: /Users/cunning/Workspace/repos/cunninglab/MetaCrucible
 Repo key: cunninglab/MetaCrucible
 
 ## Pipeline status
-Status: planning
+Status: implementing
 Branch: sdd/issue-48-pypi-release-process
 Workspace: /Users/cunning/Workspace/worktrees/cunninglab/MetaCrucible/issue-48-pypi-release
 Workspace root: n/a
@@ -69,13 +69,13 @@ Add a Mise-routed, secret-free PyPI build + release-gate toolchain to MetaCrucib
 - Expected: all tests in `tests/test_build_task.py` PASS, including a wheel+sdist artifact assertion and a wheel exclusion assertion.
 
 ### Status
-Status: pending
+Status: in-progress
 Task review: pending
 Spec verdict: pending
 Quality verdict: pending
 Task review rounds: 0/3
 Task review report: none
-Task base: none
+Task base: cc3336fa7c542ed1697aed29ba5c709ce76fd51b
 Task head: none
 Work commits: none
 Accepted range: none
