@@ -127,16 +127,16 @@ Non-goals:
 - Expected: all tests PASS, covering the placeholder-version rejection, the missing-changelog-section rejection, the missing-tag rejection (`--check-tag`), and the all-green pass path.
 
 ### Status
-Status: in-progress
-Task review: pending
-Spec verdict: pending
-Quality verdict: pending
+Status: pass
+Task review: pass
+Spec verdict: pass
+Quality verdict: pass
 Task review rounds: 0/3
-Task review report: none
+Task review report: .sdd/work/issue-48-pypi-release/task-002/task-review-report.json
 Task base: 6fa33ff8b1eaccc4a42777c4afba122fa35edc41
 Task head: f0c1673499a874f163610b2bfeae4645658c0be8
 Work commits: f0c1673499a874f163610b2bfeae4645658c0be8
-Accepted range: none
+Accepted range: 6fa33ff8b1eaccc4a42777c4afba122fa35edc41..f0c1673499a874f163610b2bfeae4645658c0be8
 
 ### Dispatch facts
 Implementer allowed edit scope:
